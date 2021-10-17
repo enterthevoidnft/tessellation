@@ -2,14 +2,14 @@ package org.tesselation.modules
 
 import cats.effect.Async
 import cats.syntax.semigroupk._
-
+import cats.syntax.option._
 import org.tesselation.config.AppEnvironment
 import org.tesselation.config.AppEnvironment.Testnet
 import org.tesselation.http.routes._
-
 import org.http4s.implicits.http4sKleisliResponseSyntaxOptionT
 import org.http4s.server.middleware.{RequestLogger, ResponseLogger}
 import org.http4s.{HttpApp, HttpRoutes}
+import org.typelevel.log4cats.slf4j.Slf4jLogger
 
 object HttpApi {
 
@@ -28,6 +28,7 @@ sealed abstract class HttpApi[F[_]: Async] private (
   programs: Programs[F],
   environment: AppEnvironment
 ) {
+
   private val healthRoutes = HealthRoutes[F](services.healthcheck).routes
   private val clusterRoutes =
     ClusterRoutes[F](programs.joining, programs.peerDiscovery, storages.cluster)
@@ -48,11 +49,14 @@ sealed abstract class HttpApi[F[_]: Async] private (
     healthRoutes <+>
       clusterRoutes.cliRoutes
 
+  private def logAs(loggerName: String): Option[String => F[Unit]] =
+    ((s: String) => Slf4jLogger.getLoggerFromName[F](loggerName).debug(s)).some
+
   private val loggers: HttpApp[F] => HttpApp[F] = {
     { http: HttpApp[F] =>
-      RequestLogger.httpApp(true, true)(http)
+      RequestLogger.httpApp(true, true, logAction = logAs("org.http4s.RequestLogger"))(http)
     }.andThen { http: HttpApp[F] =>
-      ResponseLogger.httpApp(true, true)(http)
+      ResponseLogger.httpApp(true, true, logAction = logAs("org.http4s.ResponseLogger"))(http)
     }
   }
 
