@@ -24,6 +24,7 @@ import org.tessellation.security.SecurityProvider
 
 import com.monovore.decline.Opts
 import com.monovore.decline.effect.CommandIOApp
+import io.estatico.newtype.ops._
 import org.typelevel.log4cats.slf4j.Slf4jLogger
 
 object Main
@@ -103,9 +104,9 @@ object Main
   private def loadKeyPair[F[_]: Async: SecurityProvider](cfg: Run): F[KeyPair] =
     KeyStoreUtils
       .readKeyPairFromStore[F](
-        cfg.keyStore.value.toString,
-        cfg.alias.value.value,
-        cfg.password.value.value.toCharArray,
-        cfg.password.value.value.toCharArray
+        cfg.keyStore.coerce.toString,
+        cfg.alias.coerce.value,
+        cfg.password.coerce.value.toCharArray,
+        cfg.password.coerce.value.toCharArray
       )
 }
