@@ -9,7 +9,7 @@ import org.tessellation.domain.snapshot.GlobalSnapshotStorage
 import org.tessellation.domain.trust.storage.TrustStorage
 import org.tessellation.infrastructure.cluster.storage.AddressStorage
 import org.tessellation.infrastructure.db.Database
-import org.tessellation.infrastructure.snapshot.{GlobalSnapshotStorage, genesis}
+import org.tessellation.infrastructure.snapshot.{GlobalSnapshotStorage, signedGenesis}
 import org.tessellation.infrastructure.trust.storage.TrustStorage
 import org.tessellation.kryo.KryoSerializer
 import org.tessellation.sdk.domain.cluster.storage.{ClusterStorage, SessionStorage}
@@ -25,7 +25,7 @@ object Storages {
     for {
       addressStorage <- AddressStorage.make[F]
       trustStorage <- TrustStorage.make[F]
-      globalSnapshotStorage <- GlobalSnapshotStorage.make[F](genesis)
+      globalSnapshotStorage <- GlobalSnapshotStorage.make[F](signedGenesis)
     } yield
       new Storages[F](
         address = addressStorage,

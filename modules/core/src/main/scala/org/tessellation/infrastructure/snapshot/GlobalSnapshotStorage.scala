@@ -8,29 +8,28 @@ import cats.syntax.flatMap._
 import cats.syntax.functor._
 import cats.syntax.order._
 
-import scala.util.control.NoStackTrace
-
-import org.tessellation.dag.snapshot.{GlobalSnapshot, SnapshotOrdinal, StateChannelSnapshotBinary}
+import org.tessellation.dag.snapshot._
 import org.tessellation.domain.snapshot.GlobalSnapshotStorage
 import org.tessellation.ext.cats.syntax.next._
 import org.tessellation.ext.crypto._
 import org.tessellation.kryo.KryoSerializer
-import org.tessellation.schema.address._
+import org.tessellation.schema.address.Address
 import org.tessellation.security.hash.Hash
+import org.tessellation.security.signature.Signed
 
 object GlobalSnapshotStorage {
 
-  def make[F[_]: Async: KryoSerializer](genesis: GlobalSnapshot): F[GlobalSnapshotStorage[F]] =
-    Ref[F].of[NonEmptyList[GlobalSnapshot]](NonEmptyList.of(genesis)).map(make(_))
+  def make[F[_]: Async: KryoSerializer](genesis: Signed[GlobalSnapshot]): F[GlobalSnapshotStorage[F]] =
+    Ref[F].of[NonEmptyList[Signed[GlobalSnapshot]]](NonEmptyList.of(genesis)).map(make(_))
 
-  def make[F[_]: Async: KryoSerializer](
-    snapshotsRef: Ref[F, NonEmptyList[GlobalSnapshot]]
+  private def make[F[_]: Async: KryoSerializer](
+    snapshotsRef: Ref[F, NonEmptyList[Signed[GlobalSnapshot]]]
   ): GlobalSnapshotStorage[F] = new GlobalSnapshotStorage[F] {
 
-    def save(snapshot: GlobalSnapshot): F[Unit] =
+    def save(snapshot: Signed[GlobalSnapshot]): F[Unit] =
       snapshotsRef.modify { snapshots =>
         val lastSnapshot = snapshots.head
-        lastSnapshot.hash match {
+        lastSnapshot.value.hash match {
           case Left(error) => (snapshots, error.raiseError[F, Unit])
           case Right(lastSnapshotHash) =>
             val expectedLink = (lastSnapshotHash, lastSnapshot.ordinal.next)
@@ -43,25 +42,29 @@ object GlobalSnapshotStorage {
         }
       }.flatten
 
-    def get(ordinal: SnapshotOrdinal): F[Option[GlobalSnapshot]] =
+    def get(ordinal: SnapshotOrdinal): F[Option[Signed[GlobalSnapshot]]] =
       snapshotsRef.get.map(_.find(_.ordinal === ordinal))
 
-    def getLast: F[GlobalSnapshot] = snapshotsRef.get.map(_.head)
+    def getLast: F[Signed[GlobalSnapshot]] = snapshotsRef.get.map(_.head)
 
-    def getStateChannelSnapshotUntilOrdinal(
-      ordinal: SnapshotOrdinal
-    )(address: Address): F[Option[StateChannelSnapshotBinary]] =
+    def getGlobalSnapshotInfo(ordinal: SnapshotOrdinal): F[GlobalSnapshotInfo] =
       snapshotsRef.get.map { snapshots =>
-        snapshots.find { snapshot =>
-          snapshot.ordinal <= ordinal && snapshot.stateChannelSnapshots.contains(address)
-        }.flatMap { snapshot =>
-          snapshot.stateChannelSnapshots.get(address).map(_.head)
-        }
+        val lastStateChannelSnapshotHashes = snapshots
+          .filter(_.ordinal <= ordinal)
+          .foldLeft(Map.empty[Address, Hash]) { (acc, globalSnapshot) =>
+            acc ++
+              globalSnapshot.stateChannelSnapshots.view
+                .filterKeys(!acc.contains(_))
+                .mapValues(nel => Hash.fromBytes(nel.head.content))
+                .toMap
+          }
+        GlobalSnapshotInfo(ordinal, lastStateChannelSnapshotHashes)
       }
   }
 
   type GlobalSnapshotLink = (Hash, SnapshotOrdinal)
 
-  case class InvalidGlobalSnapshotChain(expected: GlobalSnapshotLink, actual: GlobalSnapshotLink) extends NoStackTrace
+  case class InvalidGlobalSnapshotChain(expected: GlobalSnapshotLink, actual: GlobalSnapshotLink)
+      extends Throwable(s"Expected link $expected, actual link $actual")
 
 }

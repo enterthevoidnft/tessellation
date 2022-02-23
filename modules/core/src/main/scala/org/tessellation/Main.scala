@@ -10,7 +10,6 @@ import org.tessellation.ext.cats.effect._
 import org.tessellation.http.p2p.P2PClient
 import org.tessellation.infrastructure.db.Database
 import org.tessellation.infrastructure.genesis.{Loader => GenesisLoader}
-import org.tessellation.infrastructure.snapshot.SnapshotTriggerPipeline
 import org.tessellation.infrastructure.trust.handler.trustHandler
 import org.tessellation.modules._
 import org.tessellation.schema.node.NodeState
@@ -43,25 +42,23 @@ object Main
         p2pClient = P2PClient.make[IO](sdkP2PClient, sdkResources.client, sdkServices.session)
         queues <- Queues.make[IO](sdkQueues).asResource
         storages <- Storages.make[IO](sdkStorages).asResource
-        services <- Services.make[IO](sdkServices, queues).asResource
+        services <- Services.make[IO](sdkServices, queues, storages, sdk.nodeId, keyPair, cfg).asResource
         programs = Programs.make[IO](sdkPrograms, storages, services)
         validators = Validators.make[IO](cfg.snapshot)
         healthChecks <- HealthChecks
           .make[IO](storages, services, p2pClient, cfg.healthCheck, sdk.nodeId)
           .asResource
 
+        streams = Streams.make(storages, validators, queues, cfg)
+
         _ <- services.stateChannelRunner.initializeKnownCells.asResource
 
-        snapshotTriggerStream = SnapshotTriggerPipeline.stream(
-          storages.globalSnapshot,
-          validators.snapshotPreconditions,
-          queues.l1Output,
-          cfg.snapshot
-        )
-
         rumorHandler = RumorHandlers.make[IO](storages.cluster, healthChecks.ping).handlers <+>
-          trustHandler(storages.trust)
-        _ <- Daemons.start(storages, services, queues, healthChecks, p2pClient, rumorHandler, nodeId, cfg).asResource
+          trustHandler(storages.trust) <+> services.consensus.handler
+
+        _ <- Daemons
+          .start(storages, services, queues, healthChecks, streams, p2pClient, rumorHandler, nodeId, cfg)
+          .asResource
 
         api = HttpApi.make[IO](storages, queues, services, programs, keyPair.getPrivate, cfg.environment, sdk.nodeId)
         _ <- MkHttpServer[IO].newEmber(ServerName("public"), cfg.http.publicHttp, api.publicApp)

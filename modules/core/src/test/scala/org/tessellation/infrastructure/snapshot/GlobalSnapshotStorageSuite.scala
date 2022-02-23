@@ -1,7 +1,6 @@
 package org.tessellation.infrastructure.snapshot
 
 import cats.effect.{IO, Resource}
-import cats.syntax.either._
 import cats.syntax.option._
 
 import org.tessellation.dag.dagSharedKryoRegistrar
@@ -24,12 +23,12 @@ object GlobalSnapshotStorageSuite extends MutableIOSuite with Checkers {
 
   test("should accept valid snapshot") { implicit kryo =>
     for {
-      storage <- GlobalSnapshotStorage.make(genesis)
-      genesisHash <- genesis.hash.liftTo[IO]
-      nextSnapshot = genesis
-        .focus(_.ordinal)
+      storage <- GlobalSnapshotStorage.make(signedGenesis)
+      genesisHash <- signedGenesis.value.hashF
+      nextSnapshot = signedGenesis
+        .focus(_.value.ordinal)
         .modify(_.next)
-        .focus(_.lastSnapshotHash)
+        .focus(_.value.lastSnapshotHash)
         .replace(genesisHash)
       _ <- storage.save(nextSnapshot)
     } yield success
@@ -37,9 +36,9 @@ object GlobalSnapshotStorageSuite extends MutableIOSuite with Checkers {
 
   test("should not accept snapshot with invalid `lastSnapshotHash`") { implicit kryo =>
     for {
-      storage <- GlobalSnapshotStorage.make(genesis)
-      nextSnapshot = genesis
-        .focus(_.ordinal)
+      storage <- GlobalSnapshotStorage.make(signedGenesis)
+      nextSnapshot = signedGenesis
+        .focus(_.value.ordinal)
         .modify(_.next)
       maybeError <- storage
         .save(nextSnapshot)
@@ -50,10 +49,10 @@ object GlobalSnapshotStorageSuite extends MutableIOSuite with Checkers {
 
   test("should not accept snapshot with invalid `ordinal`") { implicit kryo =>
     for {
-      storage <- GlobalSnapshotStorage.make(genesis)
-      genesisHash <- genesis.hash.liftTo[IO]
-      nextSnapshot = genesis
-        .focus(_.lastSnapshotHash)
+      storage <- GlobalSnapshotStorage.make(signedGenesis)
+      genesisHash <- signedGenesis.value.hashF
+      nextSnapshot = signedGenesis
+        .focus(_.value.lastSnapshotHash)
         .replace(genesisHash)
       maybeError <- storage
         .save(nextSnapshot)

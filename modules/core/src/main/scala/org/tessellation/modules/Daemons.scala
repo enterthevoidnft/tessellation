@@ -9,6 +9,7 @@ import cats.syntax.traverse._
 import org.tessellation.config.types.AppConfig
 import org.tessellation.http.p2p.P2PClient
 import org.tessellation.infrastructure.healthcheck.HealthCheckDaemon
+import org.tessellation.infrastructure.snapshot.GlobalSnapshotEventsPublisherDaemon
 import org.tessellation.infrastructure.trust.TrustDaemon
 import org.tessellation.kryo.KryoSerializer
 import org.tessellation.schema.peer.PeerId
@@ -24,6 +25,7 @@ object Daemons {
     services: Services[F],
     queues: Queues[F],
     healthChecks: HealthChecks[F],
+    streams: Streams[F],
     p2pClient: P2PClient[F],
     handler: RumorHandler[F],
     nodeId: PeerId,
@@ -42,7 +44,8 @@ object Daemons {
         ),
       NodeStateDaemon.make(storages.node, services.gossip),
       TrustDaemon.make(cfg.trust.daemon, storages.trust, nodeId),
-      HealthCheckDaemon.make(healthChecks)
+      HealthCheckDaemon.make(healthChecks),
+      GlobalSnapshotEventsPublisherDaemon.make(queues.stateChannelOutput, streams.snapshotTrigger, services.gossip)
     ).traverse(_.start).void
 
 }
