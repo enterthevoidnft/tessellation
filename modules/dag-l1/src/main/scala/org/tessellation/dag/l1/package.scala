@@ -4,6 +4,7 @@ import org.tessellation.dag.domain.block.Tips
 import org.tessellation.dag.l1.domain.consensus.block.BlockConsensusInput._
 import org.tessellation.dag.l1.domain.consensus.block.CancellationReason
 import org.tessellation.dag.l1.domain.consensus.block.CancellationReason._
+import org.tessellation.dag.domain.block.L1Output
 
 package object l1 {
 
@@ -17,6 +18,7 @@ package object l1 {
     ReceivedProposalForNonExistentOwnRound.getClass -> 806,
     MissingRoundPeers.getClass -> 807,
     CreatedInvalidBlock.getClass -> 808,
-    PeerCancelled.getClass -> 809
+    PeerCancelled.getClass -> 809,
+    classOf[L1Output] -> 810
   )
 }
