@@ -16,3 +16,13 @@ trait GlobalSnapshotStorage[F[_]] {
   )(address: Address): F[Option[StateChannelSnapshotBinary]]
 
 }
+
+trait GlobalSnapshotStorageV2[F[_]] {
+
+  def prepend(snapshot: GlobalSnapshot): F[Boolean]
+
+  def head: F[GlobalSnapshot]
+
+  def get(ordinal: SnapshotOrdinal): F[Option[GlobalSnapshot]]
+
+}
