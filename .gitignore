@@ -32,3 +32,4 @@ site/
 .bsp/
 scripts/
 /logs/
+.env
