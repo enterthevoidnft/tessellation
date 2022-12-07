@@ -6,7 +6,7 @@ import org.tessellation.schema.balance.Amount
 import org.tessellation.schema.node.NodeState
 
 import com.comcast.ip4s.{Host, Port}
-import eu.timepit.refined.types.numeric.PosInt
+import eu.timepit.refined.types.numeric.{NonNegLong, PosInt, PosLong}
 
 object types {
 
@@ -15,24 +15,35 @@ object types {
     gossipConfig: GossipConfig,
     httpConfig: HttpConfig,
     leavingDelay: FiniteDuration,
-    stateAfterJoining: NodeState,
-    healthCheck: HealthCheckConfig
+    stateAfterJoining: NodeState
   )
 
   case class RumorStorageConfig(
-    activeRetention: FiniteDuration,
-    seenRetention: FiniteDuration
+    peerRumorsCapacity: PosLong,
+    activeCommonRumorsCapacity: NonNegLong,
+    seenCommonRumorsCapacity: NonNegLong
   )
 
   case class GossipDaemonConfig(
-    fanout: Int,
+    peerRound: GossipRoundConfig,
+    commonRound: GossipRoundConfig
+  )
+
+  case class GossipRoundConfig(
+    fanout: PosInt,
     interval: FiniteDuration,
-    maxConcurrentHandlers: Int
+    maxConcurrentRounds: PosInt
   )
 
   case class GossipConfig(
     storage: RumorStorageConfig,
     daemon: GossipDaemonConfig
+  )
+
+  case class ConsensusConfig(
+    timeTriggerInterval: FiniteDuration,
+    lockDelay: FiniteDuration,
+    lockDuration: FiniteDuration
   )
 
   case class HttpClientConfig(
@@ -55,16 +66,12 @@ object types {
 
   case class HealthCheckConfig(
     ping: PingHealthCheckConfig,
-    peerDeclaration: PeerDeclarationHealthCheckConfig,
-    removeUnresponsiveParallelPeersAfter: FiniteDuration
-  )
-
-  case class PeerDeclarationHealthCheckConfig(
-    receiveTimeout: FiniteDuration,
-    triggerInterval: FiniteDuration
+    removeUnresponsiveParallelPeersAfter: FiniteDuration,
+    requestProposalsAfter: FiniteDuration
   )
 
   case class PingHealthCheckConfig(
+    enabled: Boolean,
     concurrentChecks: PosInt,
     defaultCheckTimeout: FiniteDuration,
     defaultCheckAttempts: PosInt,

@@ -8,6 +8,7 @@ import cats.syntax.either._
 import cats.syntax.flatMap._
 import cats.syntax.functor._
 import cats.syntax.option._
+import cats.syntax.show._
 import cats.syntax.traverse._
 
 import scala.concurrent.duration.FiniteDuration
@@ -23,7 +24,7 @@ import org.tessellation.dag.l1.domain.consensus.block.CoalgebraCommand._
 import org.tessellation.dag.l1.domain.consensus.block.Validator.isReadyForBlockConsensus
 import org.tessellation.dag.l1.domain.consensus.block.http.p2p.clients.BlockConsensusClient
 import org.tessellation.dag.l1.domain.consensus.round.RoundId
-import org.tessellation.dag.l1.domain.transaction.TransactionStorage
+import org.tessellation.dag.l1.domain.transaction.{TransactionStorage, transactionLoggerName}
 import org.tessellation.effects.GenUUID
 import org.tessellation.ext.collection.MapRefUtils.MapRefOps
 import org.tessellation.kernel.Cell.NullTerminal
@@ -37,9 +38,9 @@ import org.tessellation.security.{Hashed, SecurityProvider}
 
 import eu.timepit.refined.auto.{autoRefineV, autoUnwrap}
 import higherkindness.droste.{AlgebraM, CoalgebraM, scheme}
-import org.typelevel.log4cats.Logger
+import org.typelevel.log4cats.slf4j.Slf4jLogger
 
-class BlockConsensusCell[F[_]: Async: SecurityProvider: KryoSerializer: Random: Logger](
+class BlockConsensusCell[F[_]: Async: SecurityProvider: KryoSerializer: Random](
   data: BlockConsensusInput,
   ctx: BlockConsensusContext[F]
 ) extends Cell[F, StackF, BlockConsensusInput, Either[CellError, Ω], CoalgebraCommand](
@@ -107,6 +108,10 @@ class BlockConsensusCell[F[_]: Async: SecurityProvider: KryoSerializer: Random: 
 
 object BlockConsensusCell {
 
+  private def logger[F[_]: Async] = Slf4jLogger.getLogger
+
+  private def getTransactionLogger[F[_]: Async] = Slf4jLogger.getLoggerFromName(transactionLoggerName)
+
   private def getTime[F[_]: Clock](): F[FiniteDuration] = Clock[F].monotonic
 
   private def deriveConsensusPeerIds(proposal: Proposal, selfId: PeerId): Set[PeerId] =
@@ -119,6 +124,10 @@ object BlockConsensusCell {
     ownProposal.transactions.toList
       .traverse(_.toHashed[F])
       .map(_.toSet)
+      .flatTap { txs =>
+        getTransactionLogger[F]
+          .info(s"Returned transactions for round: ${ownProposal.roundId} are: ${txs.size}, ${txs.map(_.hash).show}")
+      }
       .flatMap {
         transactionStorage.put
       }
@@ -187,7 +196,7 @@ object BlockConsensusCell {
               .map(_ => CellError("Another own round already in progress! Transactions returned.").asLeft[Ω])
         }
 
-    def persistInitialPeerRoundData[F[_]: Async: SecurityProvider: KryoSerializer: Logger](
+    def persistInitialPeerRoundData[F[_]: Async: SecurityProvider: KryoSerializer](
       roundData: RoundData,
       peerProposal: Proposal,
       ctx: BlockConsensusContext[F]
@@ -200,7 +209,7 @@ object BlockConsensusCell {
             sendOwnProposal(ownProposal, peers, ctx)
           case None =>
             for {
-              _ <- Logger[F]
+              _ <- logger
                 .debug(
                   s"Round with roundId=${roundData.roundId} already exists! Returning transactions and processing proposal!"
                 )
@@ -279,52 +288,52 @@ object BlockConsensusCell {
 
     private val validationParams: BlockValidationParams = BlockValidationParams.default.copy(minSignatureCount = 1)
 
-    def persistProposal[F[_]: Async: SecurityProvider: KryoSerializer: Logger](
+    def persistProposal[F[_]: Async: SecurityProvider: KryoSerializer](
       proposal: Proposal,
       ctx: BlockConsensusContext[F]
-    ): F[Either[CellError, Ω]] =
-      (proposal.owner == ctx.selfId)
-        .pure[F]
-        .ifM(
-          ctx.consensusStorage.ownConsensus.modify(tryPersistProposal(proposal)),
-          ctx.consensusStorage.peerConsensuses(proposal.roundId).modify(tryPersistProposal(proposal))
-        )
-        .flatMap {
-          case Some(roundData) if gotAllProposals(roundData) =>
-            roundData.formBlock() match {
-              case Some(block) =>
-                Signed.forAsyncKryo(block, ctx.keyPair).flatMap { signedBlock =>
-                  ctx.blockValidator
-                    .validate(signedBlock, validationParams)
-                    .flatTap { validationResult =>
-                      Applicative[F].whenA(validationResult.isInvalid) {
-                        Logger[F].debug(s"Created block is invalid: $validationResult")
-                      }
+    ): F[Either[CellError, Ω]] = (proposal.owner == ctx.selfId)
+      .pure[F]
+      .ifM(
+        ctx.consensusStorage.ownConsensus.modify(tryPersistProposal(proposal)),
+        ctx.consensusStorage.peerConsensuses(proposal.roundId).modify(tryPersistProposal(proposal))
+      )
+      .flatMap {
+        case Some(roundData) if gotAllProposals(roundData) =>
+          roundData.formBlock(ctx.transactionValidator).flatMap {
+            case Some(block) =>
+              Signed.forAsyncKryo(block, ctx.keyPair).flatMap { signedBlock =>
+                ctx.blockValidator
+                  .validate(signedBlock, validationParams)
+                  .flatTap { validationResult =>
+                    Applicative[F].whenA(validationResult.isInvalid) {
+                      logger.debug(s"Created block is invalid: $validationResult")
                     }
-                    .map(_.isValid)
-                    .ifM(
-                      processValidBlock(proposal, signedBlock, ctx), {
-                        val cancellation = CancelledBlockCreationRound(
-                          roundData.roundId,
-                          senderId = ctx.selfId,
-                          owner = roundData.owner,
-                          CreatedInvalidBlock
-                        )
-                        processCancellation(cancellation, ctx)
-                      }
-                    )
-                }
-              case None =>
-                val cancellation = CancelledBlockCreationRound(
-                  roundData.roundId,
-                  senderId = ctx.selfId,
-                  owner = roundData.owner,
-                  CreatedBlockWithNoTransactions
-                )
-                processCancellation(cancellation, ctx)
-            }
-          case _ => NullTerminal.asRight[CellError].widen[Ω].pure[F]
-        }
+                  }
+                  .map(_.isValid)
+                  .ifM(
+                    processValidBlock(proposal, signedBlock, ctx), {
+                      val cancellation = CancelledBlockCreationRound(
+                        roundData.roundId,
+                        senderId = ctx.selfId,
+                        owner = roundData.owner,
+                        CreatedInvalidBlock
+                      )
+                      processCancellation(cancellation, ctx)
+                    }
+                  )
+              }
+            case None =>
+              val cancellation = CancelledBlockCreationRound(
+                roundData.roundId,
+                senderId = ctx.selfId,
+                owner = roundData.owner,
+                CreatedBlockWithNoTransactions
+              )
+              processCancellation(cancellation, ctx)
+          }
+        case _ => NullTerminal.asRight[CellError].widen[Ω].pure[F]
+
+      }
 
     private def canPersistBlockSignatureProposal(
       roundData: RoundData,
@@ -388,7 +397,7 @@ object BlockConsensusCell {
       ctx: BlockConsensusContext[F]
     ): F[Either[CellError, Ω]] =
       for {
-        peersToInform <- ctx.clusterStorage.getPeers
+        peersToInform <- ctx.clusterStorage.getResponsivePeers
           .map(_.filter(peer => deriveConsensusPeerIds(proposal, ctx.selfId).contains(peer.id)))
         cancellation = CancelledBlockCreationRound(
           proposal.roundId,
@@ -493,7 +502,7 @@ object BlockConsensusCell {
   object Coalgebra {
 
     private def pullNewConsensusPeers[F[_]: Async: Random](ctx: BlockConsensusContext[F]): F[Option[Set[Peer]]] =
-      ctx.clusterStorage.getPeers
+      ctx.clusterStorage.getResponsivePeers
         .map(_.filter(p => isReadyForBlockConsensus(p.state)))
         .flatMap(peers => Random[F].shuffleList(peers.toList))
         .map(_.take(ctx.consensusConfig.peersCount).toSet match {
@@ -549,7 +558,7 @@ object BlockConsensusCell {
       ctx: BlockConsensusContext[F]
     ): F[Option[Set[Peer]]] =
       for {
-        knownPeers <- ctx.clusterStorage.getPeers
+        knownPeers <- ctx.clusterStorage.getResponsivePeers
         peerIds = deriveConsensusPeerIds(proposal, ctx.selfId)
         peers = peerIds
           .map(id => id -> knownPeers.find(_.id == id))

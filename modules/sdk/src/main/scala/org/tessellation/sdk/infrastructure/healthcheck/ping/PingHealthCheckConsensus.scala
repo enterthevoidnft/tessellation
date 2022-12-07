@@ -2,13 +2,14 @@ package org.tessellation.sdk.infrastructure.healthcheck.ping
 
 import cats.Applicative
 import cats.effect._
-import cats.effect.std.Random
+import cats.effect.std.{Random, Supervisor}
 import cats.syntax.applicative._
 import cats.syntax.applicativeError._
 import cats.syntax.contravariantSemigroupal._
 import cats.syntax.eq._
 import cats.syntax.flatMap._
 import cats.syntax.functor._
+import cats.syntax.show._
 import cats.syntax.traverse._
 import cats.syntax.traverseFilter._
 
@@ -57,7 +58,8 @@ class PingHealthCheckConsensus[F[_]: Async: GenUUID: Random](
   ]],
   waitingProposals: Ref[F, Set[PingConsensusHealthStatus]],
   httpClient: PingHealthCheckHttpClient[F]
-) extends HealthCheckConsensus[
+)(implicit S: Supervisor[F])
+    extends HealthCheckConsensus[
       F,
       PingHealthCheckKey,
       PingHealthCheckStatus,
@@ -82,12 +84,34 @@ class PingHealthCheckConsensus[F[_]: Async: GenUUID: Random](
     rounds
 
   def ownStatus(key: PingHealthCheckKey): F[Fiber[F, Throwable, PingHealthCheckStatus]] =
-    Spawn[F].start(checkPeer(key.id, key.ip, key.p2pPort, key.session))
+    S.supervise(checkPeer(key.id, key.ip, key.p2pPort, key.session))
 
   def statusOnError(key: PingHealthCheckKey): PingHealthCheckStatus = PeerCheckUnexpectedError(key.id)
 
   def periodic: F[Unit] =
-    checkRandomPeers
+    Applicative[F].whenA(config.ping.enabled) {
+      checkRandomPeers
+    }
+
+  override def startOwnRound(key: PingHealthCheckKey): F[Unit] =
+    Applicative[F].whenA(config.ping.enabled) {
+      super.startOwnRound(key)
+    }
+
+  override def participateInRound(key: PingHealthCheckKey, roundIds: Set[HealthCheckRoundId]): F[Unit] =
+    Applicative[F].whenA(config.ping.enabled) {
+      super.participateInRound(key, roundIds)
+    }
+
+  override def startRound(key: PingHealthCheckKey, roundIds: Set[HealthCheckRoundId]): F[Unit] =
+    Applicative[F].whenA(config.ping.enabled) {
+      super.startRound(key, roundIds)
+    }
+
+  override def handleProposal(proposal: PingConsensusHealthStatus, depth: Int): F[Unit] =
+    Applicative[F].whenA(config.ping.enabled) {
+      super.handleProposal(proposal, depth)
+    }
 
   def onOutcome(
     outcomes: ConsensusRounds.Outcome[
@@ -100,43 +124,54 @@ class PingHealthCheckConsensus[F[_]: Async: GenUUID: Random](
   ): F[Unit] =
     outcomes.toList.traverse {
       case (key, t) =>
-        def rejoin = joining.join(PeerToJoin(key.id, key.ip, key.p2pPort))
+        def rejoin =
+          joining.rejoin(PeerToJoin(key.id, key.ip, key.p2pPort)).handleErrorWith(err => logger.error(err)(s"Rejoin conditions not met"))
         t match {
           case (DecisionKeepPeer, round) =>
-            round.ownConsensusHealthStatus.map(_.status).flatMap {
-              case PeerAvailable(_) | PeerUnavailable(_) | PeerCheckTimeouted(_) | PeerCheckUnexpectedError(_) =>
-                logger.info(s"Outcome for peer ${key.id}: available - no action required")
-              case _: PeerMismatch =>
-                logger.info(s"Outcome for peer ${key.id}: available, own: mismatch - removing and rejoining") >>
-                  clusterStorage.removePeer(key.id) >>
-                  rejoin
-              case _: PeerUnknown =>
-                logger.info(s"Outcome for peer ${key.id}: available, own: unknown - rejoining") >>
-                  rejoin
+            round.getRoundIds.flatMap { roundIds =>
+              round.ownConsensusHealthStatus.map(_.status).flatMap {
+                case PeerAvailable(_) | PeerUnavailable(_) | PeerCheckTimeouted(_) | PeerCheckUnexpectedError(_) =>
+                  logger.info(s"Outcome for key ${key.show}: available - no action required | Round ids: ${roundIds.show}")
+                case _: PeerMismatch =>
+                  logger.info(
+                    s"Outcome for key ${key.show}: available, own: mismatch - removing and rejoining | Round ids: ${roundIds.show}"
+                  ) >>
+                    clusterStorage.removePeer(key.id) >>
+                    rejoin
+                case _: PeerUnknown =>
+                  logger.info(s"Outcome for key ${key.show}: available, own: unknown - rejoining | Round ids: ${roundIds.show}") >>
+                    rejoin
+              }
             }
           case (DecisionPeerMismatch, round) =>
-            round.ownConsensusHealthStatus.map(_.status).flatMap {
-              case _: PeerMismatch =>
-                logger.info(s"Outcome for peer ${key.id}: mismatch - ignoring healthcheck round")
-              case PeerAvailable(_) | PeerUnavailable(_) | PeerUnknown(_) | PeerCheckTimeouted(_) | PeerCheckUnexpectedError(_) =>
-                logger.info(s"Outcome for peer ${key.id}: mismatch - removing peer") >>
-                  clusterStorage.removePeer(key.id)
+            round.getRoundIds.flatMap { roundIds =>
+              round.ownConsensusHealthStatus.map(_.status).flatMap {
+                case _: PeerMismatch =>
+                  logger.info(s"Outcome for key ${key.show}: mismatch - ignoring healthcheck round | Round ids: ${roundIds.show}")
+                case PeerAvailable(_) | PeerUnavailable(_) | PeerUnknown(_) | PeerCheckTimeouted(_) | PeerCheckUnexpectedError(_) =>
+                  logger.info(s"Outcome for key ${key.show}: mismatch - removing peer | Round ids: ${roundIds.show}") >>
+                    clusterStorage.removePeer(key.id)
+              }
             }
-          case (DecisionDropPeer, _) =>
-            clusterStorage
-              .getPeer(key.id)
-              .map(_.exists(_.session === key.session))
-              .ifM(
-                logger.info(s"Outcome for peer ${key.id}: unavailable - removing peer") >>
-                  clusterStorage.removePeer(key.id),
-                logger.info(s"Outcome for peer ${key.id}: unavailable - known peer has a different session, ignoring")
-              )
+          case (DecisionDropPeer, round) =>
+            round.getRoundIds.flatMap { roundIds =>
+              clusterStorage
+                .getPeer(key.id)
+                .map(_.exists(_.session === key.session))
+                .ifM(
+                  logger.info(s"Outcome for key ${key.show}: unavailable - removing peer | Round ids: ${roundIds.show}") >>
+                    clusterStorage.removePeer(key.id),
+                  logger.info(
+                    s"Outcome for key ${key.show}: unavailable - known peer has a different session, ignoring | Round ids: ${roundIds.show}"
+                  )
+                )
+            }
         }
     }.void
 
   private def checkRandomPeers: F[Unit] =
-    clusterStorage.getPeers
-      .map(_.filterNot(p => NodeState.absent.contains(p.state)).toList)
+    clusterStorage.getResponsivePeers
+      .map(_.filterNot(NodeState.is(NodeState.leaving ++ NodeState.absent)).toList)
       .flatMap(peers => peersUnderConsensus.map(uc => peers.filterNot(p => uc.contains(p.id))))
       .flatMap(pickRandomPeers(_, config.ping.concurrentChecks))
       .flatMap(_.traverse(p => checkPeer(p.id, p.ip, p.p2pPort, p.session).map(s => p -> s)))
@@ -159,10 +194,14 @@ class PingHealthCheckConsensus[F[_]: Async: GenUUID: Random](
         startOwnRound(PingHealthCheckKey(peer.id, peer.ip, peer.p2pPort, peer.session))
       )
 
-  def requestProposal(peer: PeerId, round: HealthCheckRoundId): F[Option[PingConsensusHealthStatus]] =
+  def requestProposal(
+    peer: PeerId,
+    roundIds: Set[HealthCheckRoundId],
+    ownProposal: PingConsensusHealthStatus
+  ): F[Option[PingConsensusHealthStatus]] =
     clusterStorage
       .getPeer(peer)
-      .flatMap(_.map(toP2PContext).traverse(httpClient.requestProposal(round).run))
+      .flatMap(_.map(toP2PContext).traverse(httpClient.requestProposal(roundIds, ownProposal).run))
       .map(_.flatten)
 
   private def checkPeer(
@@ -226,7 +265,7 @@ class PingHealthCheckConsensus[F[_]: Async: GenUUID: Random](
 
 object PingHealthCheckConsensus {
 
-  def make[F[_]: Async: KryoSerializer: GenUUID: Random](
+  def make[F[_]: Async: KryoSerializer: GenUUID: Random: Supervisor](
     clusterStorage: ClusterStorage[F],
     joining: Joining[F],
     selfId: PeerId,

@@ -1,40 +1,60 @@
 package org.tessellation.schema
 
-import cats.effect.Concurrent
-import cats.kernel.Monoid
+import cats.kernel.{Monoid, Next, PartialOrder}
+import cats.syntax.monoid._
 import cats.syntax.show._
 import cats.{Order, Show}
 
 import scala.reflect.runtime.universe.{TypeTag, typeOf}
 
-import org.tessellation.ext.codecs.BinaryCodec
-import org.tessellation.kryo.KryoSerializer
+import org.tessellation.schema.generation.Generation
 import org.tessellation.schema.peer.PeerId
+import org.tessellation.security.Encodable
 import org.tessellation.security.hash.Hash
+import org.tessellation.security.hex.Hex
 import org.tessellation.security.signature.Signed
 
-import derevo.cats.{eqv, order, show}
+import derevo.cats.{order, show}
+import derevo.circe.magnolia._
 import derevo.derive
 import derevo.scalacheck.arbitrary
+import eu.timepit.refined.auto._
+import eu.timepit.refined.cats._
 import eu.timepit.refined.scalacheck.numeric._
 import eu.timepit.refined.types.numeric.PosLong
+import io.circe.Json
 import io.estatico.newtype.macros.newtype
-import org.http4s.{EntityDecoder, EntityEncoder}
+import io.estatico.newtype.ops._
 
 object gossip {
 
-  @derive(arbitrary, eqv, show, order)
-  case class Ordinal(generation: PosLong, counter: PosLong)
+  @derive(arbitrary, order, show, encoder, decoder)
+  @newtype
+  case class Counter(value: PosLong)
+
+  object Counter {
+
+    val MinValue: Counter = Counter(PosLong.MinValue)
+
+    implicit val next: Next[Counter] = new Next[Counter] {
+      override def next(a: Counter): Counter = Counter(a.value |+| 1L)
+
+      override def partialOrder: PartialOrder[Counter] = Order[Counter]
+    }
+  }
+
+  @derive(arbitrary, order, show, encoder, decoder)
+  case class Ordinal(generation: Generation, counter: Counter)
 
   object Ordinal {
 
-    val MinValue: Ordinal = Ordinal(PosLong.MinValue, PosLong.MinValue)
+    val MinValue: Ordinal = Ordinal(Generation.MinValue, Counter.MinValue)
 
     implicit val maxMonoid: Monoid[Ordinal] = Monoid.instance(MinValue, (a, b) => Order[Ordinal].max(a, b))
 
   }
 
-  @derive(arbitrary, eqv, show)
+  @derive(arbitrary, order, show, encoder, decoder)
   @newtype
   case class ContentType(value: String)
 
@@ -42,97 +62,75 @@ object gossip {
     def of[A: TypeTag]: ContentType = ContentType(typeOf[A].dealias.toString)
   }
 
-  type HashAndRumor = (Hash, Signed[RumorBinary])
+  type HashAndRumor = (Hash, Signed[RumorRaw])
   type RumorBatch = List[HashAndRumor]
 
   case class PeerRumor[A](origin: PeerId, ordinal: Ordinal, content: A)
 
   case class CommonRumor[A](content: A)
 
-  sealed trait RumorBinary {
-    val content: Array[Byte]
+  @derive(encoder, decoder)
+  sealed trait RumorRaw extends Encodable {
+    val content: Json
     val contentType: ContentType
   }
 
-  object RumorBinary {
-    implicit val show: Show[RumorBinary] = {
-      case r: CommonRumorBinary => Show[CommonRumorBinary].show(r)
-      case r: PeerRumorBinary   => Show[PeerRumorBinary].show(r)
+  object RumorRaw {
+    implicit val show: Show[RumorRaw] = {
+      case r: CommonRumorRaw => Show[CommonRumorRaw].show(r)
+      case r: PeerRumorRaw   => Show[PeerRumorRaw].show(r)
     }
   }
 
-  final case class CommonRumorBinary(
-    content: Array[Byte],
+  @derive(encoder, decoder)
+  final case class CommonRumorRaw(
+    content: Json,
     contentType: ContentType
-  ) extends RumorBinary
-
-  object CommonRumorBinary {
-    implicit val show: Show[CommonRumorBinary] = (t: CommonRumorBinary) => s"CommonRumorBinary(contentType=${t.contentType.show})"
+  ) extends RumorRaw {
+    override def toEncode: AnyRef = content.noSpacesSortKeys ++ contentType.coerce[String]
   }
 
-  @derive(arbitrary)
-  final case class PeerRumorBinary(
+  object CommonRumorRaw {
+    implicit val show: Show[CommonRumorRaw] = (t: CommonRumorRaw) => s"CommonRumorRaw(contentType=${t.contentType.show})"
+  }
+
+  @derive(encoder, decoder)
+  final case class PeerRumorRaw(
     origin: PeerId,
     ordinal: Ordinal,
-    content: Array[Byte],
+    content: Json,
     contentType: ContentType
-  ) extends RumorBinary
-
-  object PeerRumorBinary {
-    implicit val show: Show[PeerRumorBinary] = (t: PeerRumorBinary) =>
-      s"PeerRumorBinary(origin=${t.origin.show}, ordinal=${t.ordinal.show}, contentType=${t.contentType.show})"
+  ) extends RumorRaw {
+    override def toEncode: AnyRef =
+      content.noSpacesSortKeys ++ contentType
+        .coerce[String] ++ origin.coerce[Hex].coerce[String] ++ ordinal.counter.toString ++ ordinal.generation.toString
   }
 
-  case class UnexpectedRumorClass(rumor: RumorBinary) extends Throwable(s"Unexpected rumor class ${rumor.show}")
+  object PeerRumorRaw {
+    implicit val show: Show[PeerRumorRaw] = (t: PeerRumorRaw) =>
+      s"PeerRumorRaw(origin=${t.origin.show}, ordinal=${t.ordinal.show}, contentType=${t.contentType.show})"
+  }
 
-  case class StartGossipRoundRequest(
-    offer: List[Hash]
+  case class UnexpectedRumorClass(rumor: RumorRaw) extends Throwable(s"Unexpected rumor class ${rumor.show}")
+
+  @derive(encoder, decoder)
+  case class PeerRumorInquiryRequest(
+    ordinals: Map[PeerId, Ordinal]
   )
 
-  object StartGossipRoundRequest {
-    implicit def encoder[G[_]: KryoSerializer]: EntityEncoder[G, StartGossipRoundRequest] =
-      BinaryCodec.encoder[G, StartGossipRoundRequest]
-
-    implicit def decoder[G[_]: Concurrent: KryoSerializer]: EntityDecoder[G, StartGossipRoundRequest] =
-      BinaryCodec.decoder[G, StartGossipRoundRequest]
-  }
-
-  case class StartGossipRoundResponse(
-    inquiry: List[Hash],
-    offer: List[Hash]
+  @derive(encoder, decoder)
+  case class CommonRumorOfferResponse(
+    offer: Set[Hash]
   )
 
-  object StartGossipRoundResponse {
-    implicit def encoder[G[_]: KryoSerializer]: EntityEncoder[G, StartGossipRoundResponse] =
-      BinaryCodec.encoder[G, StartGossipRoundResponse]
-
-    implicit def decoder[G[_]: Concurrent: KryoSerializer]: EntityDecoder[G, StartGossipRoundResponse] =
-      BinaryCodec.decoder[G, StartGossipRoundResponse]
-  }
-
-  case class EndGossipRoundRequest(
-    answer: RumorBatch,
-    inquiry: List[Hash]
+  @derive(encoder, decoder)
+  case class QueryCommonRumorsRequest(
+    query: Set[Hash]
   )
 
-  object EndGossipRoundRequest {
-    implicit def encoder[G[_]: KryoSerializer]: EntityEncoder[G, EndGossipRoundRequest] =
-      BinaryCodec.encoder[G, EndGossipRoundRequest]
-
-    implicit def decoder[G[_]: Concurrent: KryoSerializer]: EntityDecoder[G, EndGossipRoundRequest] =
-      BinaryCodec.decoder[G, EndGossipRoundRequest]
-  }
-
-  case class EndGossipRoundResponse(
-    answer: RumorBatch
+  @derive(encoder, decoder)
+  case class CommonRumorInitResponse(
+    seen: Set[Hash]
   )
-
-  object EndGossipRoundResponse {
-    implicit def encoder[G[_]: KryoSerializer]: EntityEncoder[G, EndGossipRoundResponse] =
-      BinaryCodec.encoder[G, EndGossipRoundResponse]
-
-    implicit def decoder[G[_]: Concurrent: KryoSerializer]: EntityDecoder[G, EndGossipRoundResponse] =
-      BinaryCodec.decoder[G, EndGossipRoundResponse]
-  }
 
 }

@@ -33,34 +33,30 @@ object method {
       db = dbConfig,
       gossip = GossipConfig(
         storage = RumorStorageConfig(
-          activeRetention = 2.seconds,
-          seenRetention = 2.minutes
+          peerRumorsCapacity = 50L,
+          activeCommonRumorsCapacity = 20L,
+          seenCommonRumorsCapacity = 50L
         ),
         daemon = GossipDaemonConfig(
-          fanout = 2,
-          interval = 0.2.seconds,
-          maxConcurrentHandlers = 20
+          peerRound = GossipRoundConfig(
+            fanout = 1,
+            interval = 0.2.seconds,
+            maxConcurrentRounds = 4
+          ),
+          commonRound = GossipRoundConfig(
+            fanout = 1,
+            interval = 0.5.seconds,
+            maxConcurrentRounds = 2
+          )
         )
       ),
       consensus = ConsensusConfig(
         peersCount = 2,
         tipsCount = 2,
-        timeout = 5.seconds,
+        timeout = 45.seconds,
         pullTxsCount = 100L
       ),
-      healthCheck = HealthCheckConfig(
-        removeUnresponsiveParallelPeersAfter = 10.seconds,
-        ping = PingHealthCheckConfig(
-          concurrentChecks = 3,
-          defaultCheckTimeout = 10.seconds,
-          defaultCheckAttempts = 3,
-          ensureCheckInterval = 10.seconds
-        ),
-        peerDeclaration = PeerDeclarationHealthCheckConfig(
-          receiveTimeout = 20.seconds,
-          triggerInterval = 10.seconds
-        )
-      ),
+      healthCheck = healthCheckConfig(false),
       collateral = collateralConfig(environment, collateralAmount)
     )
   }

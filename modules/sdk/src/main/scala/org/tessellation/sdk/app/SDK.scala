@@ -2,9 +2,10 @@ package org.tessellation.sdk.app
 
 import java.security.KeyPair
 
-import cats.effect.std.Random
+import cats.effect.std.{Random, Supervisor}
 
 import org.tessellation.kryo.KryoSerializer
+import org.tessellation.schema.generation.Generation
 import org.tessellation.schema.peer.PeerId
 import org.tessellation.sdk.http.p2p.SdkP2PClient
 import org.tessellation.sdk.infrastructure.metrics.Metrics
@@ -19,9 +20,11 @@ trait SDK[F[_]] {
   implicit val securityProvider: SecurityProvider[F]
   implicit val kryoPool: KryoSerializer[F]
   implicit val metrics: Metrics[F]
+  implicit val supervisor: Supervisor[F]
 
   val keyPair: KeyPair
   lazy val nodeId = PeerId.fromPublic(keyPair.getPublic)
+  val generation: Generation
   val seedlist: Option[Set[PeerId]]
 
   val sdkResources: SdkResources[F]

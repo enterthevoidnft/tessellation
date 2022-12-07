@@ -1,7 +1,7 @@
 package org.tessellation.sdk.domain.healthcheck.consensus
 
-import cats.Applicative
 import cats.effect._
+import cats.effect.std.Supervisor
 import cats.syntax.applicative._
 import cats.syntax.applicativeError._
 import cats.syntax.contravariantSemigroupal._
@@ -10,26 +10,28 @@ import cats.syntax.flatMap._
 import cats.syntax.functor._
 import cats.syntax.option._
 import cats.syntax.show._
+import cats.{Applicative, Show}
 
 import scala.concurrent.duration._
 import scala.reflect.runtime.universe.TypeTag
 
 import org.tessellation.schema.node.NodeState
-import org.tessellation.schema.peer.{Peer, PeerId}
+import org.tessellation.schema.peer.{Peer, PeerId, Unresponsive}
 import org.tessellation.sdk.config.types.HealthCheckConfig
 import org.tessellation.sdk.domain.cluster.storage.ClusterStorage
 import org.tessellation.sdk.domain.gossip.Gossip
 import org.tessellation.sdk.domain.healthcheck.consensus.HealthCheckConsensusRound._
 import org.tessellation.sdk.domain.healthcheck.consensus.types._
 
+import io.circe.Encoder
 import org.typelevel.log4cats.slf4j.Slf4jLogger
 
-class HealthCheckConsensusRound[F[_]: Async, K <: HealthCheckKey, A <: HealthCheckStatus, B <: ConsensusHealthStatus[
+class HealthCheckConsensusRound[F[_]: Async, K <: HealthCheckKey: Show, A <: HealthCheckStatus, B <: ConsensusHealthStatus[
   K,
   A
-]: TypeTag, C <: HealthCheckConsensusDecision](
+]: TypeTag: Encoder, C <: HealthCheckConsensusDecision](
   key: K,
-  roundId: HealthCheckRoundId,
+  initialRoundIds: Set[HealthCheckRoundId],
   driver: HealthCheckConsensusDriver[K, A, B, C],
   config: HealthCheckConfig,
   startedAt: FiniteDuration,
@@ -43,23 +45,27 @@ class HealthCheckConsensusRound[F[_]: Async, K <: HealthCheckKey, A <: HealthChe
   gossip: Gossip[F],
   clusterStorage: ClusterStorage[F],
   selfId: PeerId
-) {
+)(implicit S: Supervisor[F]) {
 
   def logger = Slf4jLogger.getLogger[F]
 
   def start: F[Unit] =
-    Spawn[F].start {
+    S.supervise {
       sendProposal
-        .handleErrorWith(err => logger.error(err)(s"An error occurred while sending the healthcheck proposal"))
+        .handleErrorWith(err =>
+          logger.error(err)(
+            s"An error occurred while sending the healthcheck proposal for initialRoundIds=${initialRoundIds.show} for key=${key.show}"
+          )
+        )
         .flatTap { _ =>
-          logger.info(s"HealthCheck round started with roundId=$roundId for peer=${key.id}")
+          logger.info(s"HealthCheck round started with initialRoundIds=${initialRoundIds.show} for key=${key.show}")
         }
     }.void
 
   def getPeers: F[Set[PeerId]] = peers.get
 
   def managePeers(currentPeers: Set[Peer]): F[Unit] = {
-    def absentPeers = NodeState.absent(currentPeers).map(_.id)
+    def absentPeers = NodeState.absent(currentPeers).map(_.id) ++ currentPeers.filter(_.responsiveness === Unresponsive).map(_.id)
 
     proposals.get.flatMap { received =>
       peers.update { roundPeers =>
@@ -82,6 +88,9 @@ class HealthCheckConsensusRound[F[_]: Async, K <: HealthCheckKey, A <: HealthChe
     sentProposal.get.map(_ && received)
   }
 
+  def elapsed: F[FiniteDuration] =
+    Clock[F].monotonic.map(_ - startedAt)
+
   def processProposal(proposal: B): F[Unit] =
     if (proposal.key == key) {
       proposals.modify { m =>
@@ -93,15 +102,13 @@ class HealthCheckConsensusRound[F[_]: Async, K <: HealthCheckKey, A <: HealthChe
           }
       }.flatMap {
         _.fold(Applicative[F].unit) { proposal =>
-          roundIds.update(_ + proposal.roundId) >>
+          roundIds.update(_ ++ proposal.roundIds) >>
             peers.update(_ ++ proposal.clusterState.filterNot(p => p === selfId || p === key.id))
         }
       }
     } else Applicative[F].unit
 
   def getRoundIds: F[Set[HealthCheckRoundId]] = roundIds.get
-
-  def getOwnRoundId: HealthCheckRoundId = roundId
 
   def addParallelRounds(key: K)(roundIds: Set[HealthCheckRoundId]): F[Unit] =
     parallelRounds.update { m =>
@@ -117,7 +124,9 @@ class HealthCheckConsensusRound[F[_]: Async, K <: HealthCheckKey, A <: HealthChe
 
         peers.update(_ -- missing) >>
           Applicative[F].whenA(missing.size > 0) {
-            logger.debug(s"Removed unresponsive parallel peers: ${missing.show} for round: ${roundId.show}")
+            getRoundIds.flatMap { ids =>
+              logger.debug(s"Removed unresponsive parallel peers: ${missing.show} for round: ${ids.show}")
+            }
           }
       } else Applicative[F].unit
     }.flatten
@@ -139,8 +148,8 @@ class HealthCheckConsensusRound[F[_]: Async, K <: HealthCheckKey, A <: HealthChe
     }
 
   def manage: F[Unit] =
-    Clock[F].monotonic.map(_ - startedAt).flatMap { elapsed =>
-      if (driver.removePeersWithParallelRound && elapsed >= config.removeUnresponsiveParallelPeersAfter) {
+    elapsed.flatMap { e =>
+      if (driver.removePeersWithParallelRound && e >= config.removeUnresponsiveParallelPeersAfter) {
         removeUnresponsiveParallelPeers()
       } else Applicative[F].unit
     }
@@ -149,9 +158,11 @@ class HealthCheckConsensusRound[F[_]: Async, K <: HealthCheckKey, A <: HealthChe
     roundIds.get.map(HistoricalRound(key, _, ownProposal, decision))
 
   def ownConsensusHealthStatus: F[B] =
-    clusterStorage.getPeers.map(_.map(_.id)).flatMap { clusterState =>
-      status.map {
-        driver.consensusHealthStatus(key, _, roundId, selfId, clusterState)
+    clusterStorage.getResponsivePeers.map(_.map(_.id)).flatMap { clusterState =>
+      getRoundIds.flatMap { ids =>
+        status.map {
+          driver.consensusHealthStatus(key, _, ids, selfId, clusterState)
+        }
       }
     }
 
@@ -177,12 +188,12 @@ class HealthCheckConsensusRound[F[_]: Async, K <: HealthCheckKey, A <: HealthChe
 
 object HealthCheckConsensusRound {
 
-  def make[F[_]: Async, K <: HealthCheckKey, A <: HealthCheckStatus, B <: ConsensusHealthStatus[
+  def make[F[_]: Async: Supervisor, K <: HealthCheckKey: Show, A <: HealthCheckStatus, B <: ConsensusHealthStatus[
     K,
     A
-  ]: TypeTag, C <: HealthCheckConsensusDecision](
+  ]: TypeTag: Encoder, C <: HealthCheckConsensusDecision](
     key: K,
-    roundId: HealthCheckRoundId,
+    initialRoundIds: Set[HealthCheckRoundId],
     initialPeers: Set[PeerId],
     ownStatus: Fiber[F, Throwable, A],
     statusOnError: A,
@@ -195,7 +206,7 @@ object HealthCheckConsensusRound {
 
     def mkStartedAt = Clock[F].monotonic
     def mkPeers = Ref.of[F, Set[PeerId]](initialPeers)
-    def mkRoundIds = Ref.of[F, Set[HealthCheckRoundId]](Set(roundId))
+    def mkRoundIds = Ref.of[F, Set[HealthCheckRoundId]](initialRoundIds)
     def mkProposals = Ref.of[F, Map[PeerId, B]](Map.empty)
     def mkParallelRounds = Ref.of[F, Map[K, Set[HealthCheckRoundId]]](Map.empty)
     def mkSentProposal = Ref.of[F, Boolean](false)
@@ -204,7 +215,7 @@ object HealthCheckConsensusRound {
       (startedAt, peers, roundIds, proposals, parallelRounds, sentProposal) =>
         new HealthCheckConsensusRound[F, K, A, B, C](
           key,
-          roundId,
+          initialRoundIds,
           driver,
           config,
           startedAt,

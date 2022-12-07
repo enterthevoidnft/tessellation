@@ -9,7 +9,7 @@ jobs:
   build:
     if: startsWith(github.ref, 'refs/tags/')
     name: Create Release
-    runs-on: ubuntu-18.04
+    runs-on: ubuntu-20.04
     steps:
       - uses: actions/checkout@v3
 
@@ -69,5 +69,6 @@ jobs:
             ./cl-wallet.jar
             ./cl-node.jar
             ./cl-dag-l1.jar
+            ./mainnet/mainnet-seedlist
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

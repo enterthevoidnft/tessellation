@@ -39,6 +39,7 @@ class TransactionStorage[F[_]: Async: KryoSerializer](
 ) {
 
   private val logger = Slf4jLogger.getLogger[F]
+  private val transactionLogger = Slf4jLogger.getLoggerFromName[F](transactionLoggerName)
 
   def isParentAccepted(transaction: Transaction): F[Boolean] =
     (transaction.parent != TransactionReference.empty)
@@ -112,14 +113,14 @@ class TransactionStorage[F[_]: Async: KryoSerializer](
       lastAccepted <- lastAccepted.toMap
       addresses <- waitingTransactions.keys
       txs <- addresses.traverse { address =>
-        waitingTransactions(address).get.flatMap {
+        waitingTransactions(address).get.map {
           case Some(waiting) =>
             val lastTxState = lastAccepted.getOrElse(address, Majority(TransactionReference.empty))
-            Consecutive
-              .take[F](waiting.toList, lastTxState.ref)
-              .map(consecutiveTxs => pullForAddress(lastTxState, consecutiveTxs))
+            val consecutiveTxs = Consecutive.take(waiting.toList, lastTxState.ref)
+
+            pullForAddress(lastTxState, consecutiveTxs)
           case None =>
-            List.empty[Hashed[Transaction]].pure[F]
+            List.empty[Hashed[Transaction]]
         }
       }.map(_.flatten)
     } yield txs.size
@@ -134,22 +135,22 @@ class TransactionStorage[F[_]: Async: KryoSerializer](
 
           pulled <- maybeWaiting.traverse { waiting =>
             val lastTxState = lastAccepted.getOrElse(address, Majority(TransactionReference.empty))
-            Consecutive
-              .take[F](waiting.toList, lastTxState.ref)
-              .map(consecutiveTxs => pullForAddress(lastTxState, consecutiveTxs))
-              .map(pulled => (SortedSet.from(waiting.toList.diff(pulled)).toNes, pulled))
-              .flatMap {
-                case (maybeNotPulled, pulled) =>
-                  val maybeStillWaiting = maybeNotPulled
-                    .flatMap(_.filter(_.ordinal > lastTxState.ref.ordinal).toNes)
+            val consecutiveTxs = Consecutive.take(waiting.toList, lastTxState.ref)
+            val pulled = pullForAddress(lastTxState, consecutiveTxs)
+            val maybeStillWaiting = SortedSet.from(waiting.toList.diff(pulled)).toNes
+            val maybeStillWaitingAboveOrdinal = maybeStillWaiting.flatMap(_.filter(_.ordinal > lastTxState.ref.ordinal).toNes)
+            val expiredBelowOrdinal = maybeStillWaiting.flatMap(_.filter(_.ordinal <= lastTxState.ref.ordinal).toNes)
 
-                  setter(maybeStillWaiting)
-                    .ifM(
-                      NonEmptyList.fromList(pulled).pure[F],
-                      logger.debug("Concurrent update occurred while trying to pull transactions") >>
-                        none[NonEmptyList[Hashed[Transaction]]].pure[F]
-                    )
-              }
+            setter(maybeStillWaitingAboveOrdinal).flatTap { _ =>
+              transactionLogger.info(
+                s"Expired transaction with ordinal lower or equal ${lastTxState.ref.ordinal}: ${expiredBelowOrdinal.map(_.map(_.hash)).show}"
+              )
+            }
+              .ifM(
+                NonEmptyList.fromList(pulled).pure[F],
+                logger.debug("Concurrent update occurred while trying to pull transactions") >>
+                  none[NonEmptyList[Hashed[Transaction]]].pure[F]
+              )
           }.map(_.flatten)
         } yield pulled
 
@@ -161,9 +162,11 @@ class TransactionStorage[F[_]: Async: KryoSerializer](
 
       selected = takeFirstNHighestFeeTxs(allPulled, count)
       toReturn = allPulled.flatMap(_.toList).toSet.diff(selected.toSet)
-      _ <- logger.debug(s"Transactions to return ${toReturn.size}")
+      _ <- logger.debug(s"Pulled transactions to return: ${toReturn.size}")
+      _ <- transactionLogger.debug(s"Pulled transactions to return: ${toReturn.size}, returned: ${toReturn.map(_.hash).show}")
       _ <- put(toReturn)
       _ <- logger.debug(s"Pulled ${selected.size} transaction(s) for consensus")
+      _ <- transactionLogger.debug(s"Pulled ${selected.size} transaction(s) for consensus, pulled: ${selected.map(_.hash).show}")
     } yield NonEmptyList.fromList(selected)
 
   private def pullForAddress(

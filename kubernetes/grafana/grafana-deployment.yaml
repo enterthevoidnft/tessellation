@@ -14,7 +14,7 @@ spec:
     spec:
       containers:
         - name: grafana
-          image: grafana/grafana:8.5.5
+          image: grafana/grafana:9.1.6
           ports:
             - containerPort: 3000
               name: http
@@ -24,8 +24,8 @@ spec:
               port: http
           resources:
             limits:
-              cpu: 5000m
-              memory: 500Mi
+              cpu: 1000m
+              memory: 1Gi
             requests:
               cpu: 100m
               memory: 100Mi

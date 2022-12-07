@@ -4,9 +4,12 @@ import cats.syntax.show._
 
 import scala.util.Try
 
-import org.tessellation.schema.peer.Peer
+import org.tessellation.schema.cluster.{ClusterSessionToken, SessionToken}
+import org.tessellation.schema.peer.{Peer, PeerId}
 
+import com.comcast.ip4s.{Host, Port}
 import derevo.cats.{eqv, show}
+import derevo.circe.magnolia.encoder
 import derevo.derive
 import enumeratum._
 import io.circe._
@@ -34,6 +37,7 @@ object node {
     case object WaitingForDownload extends NodeState
     case object DownloadInProgress extends NodeState
 
+    case object Observing extends NodeState
     case object Ready extends NodeState
     case object Leaving extends NodeState
     case object Offline extends NodeState
@@ -41,10 +45,17 @@ object node {
     val all: Set[NodeState] = NodeState.values.toSet
 
     val toBroadcast: Set[NodeState] =
-      Set(WaitingForDownload, DownloadInProgress, Ready, Leaving, Offline)
+      Set(WaitingForDownload, DownloadInProgress, Observing, Ready, Leaving, Offline)
+
+    def is(states: Set[NodeState])(peer: Peer) = states.contains(peer.state)
+
+    def leaving: Set[NodeState] =
+      Set(Leaving)
+
+    def leaving(peers: Set[Peer]): Set[Peer] = peers.filter(peer => leaving.contains(peer.state))
 
     def absent: Set[NodeState] =
-      Set(Leaving, Offline)
+      Set(Offline)
 
     def absent(peers: Set[Peer]): Set[Peer] = peers.filter(peer => absent.contains(peer.state))
 
@@ -52,6 +63,16 @@ object node {
       Set(Ready)
 
     def ready(peers: Set[Peer]): Set[Peer] = peers.filter(peer => ready.contains(peer.state))
+
+    def observing: Set[NodeState] = Set(Observing)
+
+    def observing(peers: Set[Peer]): Set[Peer] = peers.filter(peer => observing.contains(peer.state))
+
+    val inCluster: Set[NodeState] = Set(Observing, Ready, WaitingForDownload, DownloadInProgress)
+
+    def inCluster(state: NodeState): Boolean = inCluster.contains(state)
+
+    val inConsensus: Set[NodeState] = Set(Observing, Ready)
   }
 
   trait NodeStateCodecs {
@@ -69,5 +90,17 @@ object node {
 
   case class InvalidNodeStateTransition(current: NodeState, from: Set[NodeState], to: NodeState)
       extends Throwable(s"Invalid node state transition from ${from.show} to ${to.show} but current is ${current.show}")
+
+  @derive(encoder)
+  case class NodeInfo(
+    state: NodeState,
+    session: Option[SessionToken],
+    clusterSession: Option[ClusterSessionToken],
+    version: String,
+    host: Host,
+    publicPort: Port,
+    p2pPort: Port,
+    id: PeerId
+  )
 
 }

@@ -2,6 +2,7 @@ package org.tessellation.infrastructure.snapshot
 
 import cats.data.NonEmptyList
 import cats.effect.Async
+import cats.syntax.applicative._
 import cats.syntax.applicativeError._
 import cats.syntax.bifunctor._
 import cats.syntax.either._
@@ -21,20 +22,25 @@ import scala.util.control.NoStackTrace
 import org.tessellation.dag.block.processing._
 import org.tessellation.dag.domain.block.BlockReference
 import org.tessellation.dag.snapshot._
+import org.tessellation.domain.aci.StateChannelOutput
+import org.tessellation.domain.rewards.Rewards
 import org.tessellation.domain.snapshot._
-import org.tessellation.domain.snapshot.rewards.Rewards
 import org.tessellation.ext.cats.syntax.next._
 import org.tessellation.ext.crypto._
 import org.tessellation.kryo.KryoSerializer
 import org.tessellation.schema.address.Address
-import org.tessellation.schema.balance.Amount
+import org.tessellation.schema.balance.{Amount, Balance}
 import org.tessellation.schema.height.{Height, SubHeight}
 import org.tessellation.schema.peer.PeerId
+import org.tessellation.schema.transaction.RewardTransaction
+import org.tessellation.sdk.config.AppEnvironment
+import org.tessellation.sdk.config.AppEnvironment.Mainnet
 import org.tessellation.sdk.domain.consensus.ConsensusFunctions
-import org.tessellation.sdk.infrastructure.consensus.trigger.ConsensusTrigger
+import org.tessellation.sdk.domain.consensus.ConsensusFunctions.InvalidArtifact
+import org.tessellation.sdk.infrastructure.consensus.trigger.{ConsensusTrigger, EventTrigger, TimeTrigger}
 import org.tessellation.sdk.infrastructure.metrics.Metrics
+import org.tessellation.security.SecurityProvider
 import org.tessellation.security.hash.Hash
-import org.tessellation.security.hex.Hex
 import org.tessellation.security.signature.Signed
 import org.tessellation.syntax.sortedCollection._
 
@@ -47,11 +53,12 @@ trait GlobalSnapshotConsensusFunctions[F[_]]
 
 object GlobalSnapshotConsensusFunctions {
 
-  def make[F[_]: Async: KryoSerializer: Metrics](
+  def make[F[_]: Async: KryoSerializer: SecurityProvider: Metrics](
     globalSnapshotStorage: GlobalSnapshotStorage[F],
-    heightInterval: NonNegLong,
     blockAcceptanceManager: BlockAcceptanceManager[F],
-    collateral: Amount
+    collateral: Amount,
+    rewards: Rewards[F],
+    environment: AppEnvironment
   ): GlobalSnapshotConsensusFunctions[F] = new GlobalSnapshotConsensusFunctions[F] {
 
     private val logger = Slf4jLogger.getLoggerFromClass(GlobalSnapshotConsensusFunctions.getClass)
@@ -68,34 +75,66 @@ object GlobalSnapshotConsensusFunctions {
       event: GlobalSnapshotEvent
     ): Boolean = true // placeholder for triggering based on fee
 
+    def facilitatorFilter(lastSignedArtifact: Signed[GlobalSnapshotArtifact], peerId: PeerId): F[Boolean] =
+      peerId.toAddress[F].map { address =>
+        lastSignedArtifact.info.balances.getOrElse(address, Balance.empty).satisfiesCollateral(collateral)
+      }
+
+    def validateArtifact(lastSignedArtifact: Signed[GlobalSnapshot], trigger: ConsensusTrigger)(
+      artifact: GlobalSnapshot
+    ): F[Either[InvalidArtifact, GlobalSnapshot]] = {
+      val events = artifact.blocks.unsorted.map(_.block.asRight[StateChannelOutput])
+
+      def recreatedArtifact: F[GlobalSnapshot] = createProposalArtifact(lastSignedArtifact.ordinal, lastSignedArtifact, trigger, events)
+        .map(_._1)
+        .map { a =>
+          a.copy(
+            stateChannelSnapshots = artifact.stateChannelSnapshots,
+            info = a.info.copy(lastStateChannelSnapshotHashes = artifact.info.lastStateChannelSnapshotHashes)
+          )
+        }
+
+      recreatedArtifact
+        .map(_ === artifact)
+        .ifF(
+          artifact.asRight[InvalidArtifact],
+          ArtifactMismatch.asLeft[GlobalSnapshot]
+        )
+    }
+
     def createProposalArtifact(
-      last: (GlobalSnapshotKey, Signed[GlobalSnapshotArtifact]),
+      lastKey: GlobalSnapshotKey,
+      lastArtifact: Signed[GlobalSnapshotArtifact],
       trigger: ConsensusTrigger,
       events: Set[GlobalSnapshotEvent]
     ): F[(GlobalSnapshotArtifact, Set[GlobalSnapshotEvent])] = {
-      val (_, lastGS) = last
-
-      val (scEvents: List[StateChannelEvent], dagEvents: List[DAGEvent]) = events.toList.partitionMap(identity)
+      val (scEvents: List[StateChannelEvent], dagEvents: List[DAGEvent]) = events.filter { event =>
+        if (environment == Mainnet) event.isRight else true
+      }.toList.partitionMap(identity)
 
       val blocksForAcceptance = dagEvents
-        .filter(_.height > lastGS.height)
+        .filter(_.height > lastArtifact.height)
         .toList
 
       for {
-        lastGSHash <- lastGS.value.hashF
-        currentOrdinal = lastGS.ordinal.next
-        (scSnapshots, returnedSCEvents) = processStateChannelEvents(lastGS.info, scEvents)
+        lastArtifactHash <- lastArtifact.value.hashF
+        currentOrdinal = lastArtifact.ordinal.next
+        currentEpochProgress = trigger match {
+          case EventTrigger => lastArtifact.epochProgress
+          case TimeTrigger  => lastArtifact.epochProgress.next
+        }
+        (scSnapshots, returnedSCEvents) = processStateChannelEvents(lastArtifact.info, scEvents)
         sCSnapshotHashes <- scSnapshots.toList.traverse { case (address, nel) => nel.head.hashF.map(address -> _) }
           .map(_.toMap)
-        updatedLastStateChannelSnapshotHashes = lastGS.info.lastStateChannelSnapshotHashes ++ sCSnapshotHashes
+        updatedLastStateChannelSnapshotHashes = lastArtifact.info.lastStateChannelSnapshotHashes ++ sCSnapshotHashes
 
-        lastActiveTips <- lastGS.activeTips
-        lastDeprecatedTips = lastGS.tips.deprecated
+        lastActiveTips <- lastArtifact.activeTips
+        lastDeprecatedTips = lastArtifact.tips.deprecated
 
         tipUsages = getTipsUsages(lastActiveTips, lastDeprecatedTips)
         context = BlockAcceptanceContext.fromStaticData(
-          lastGS.info.balances,
-          lastGS.info.lastTxRefs,
+          lastArtifact.info.balances,
+          lastArtifact.info.lastTxRefs,
           tipUsages,
           collateral
         )
@@ -108,12 +147,23 @@ object GlobalSnapshotConsensusFunctions {
           currentOrdinal
         )
 
-        (height, subHeight) <- getHeightAndSubHeight(lastGS, deprecated, remainedActive, accepted)
+        (height, subHeight) <- getHeightAndSubHeight(lastArtifact, deprecated, remainedActive, accepted)
 
-        updatedLastTxRefs = lastGS.info.lastTxRefs ++ acceptanceResult.contextUpdate.lastTxRefs
-        updatedBalances = lastGS.info.balances ++ acceptanceResult.contextUpdate.balances
+        updatedLastTxRefs = lastArtifact.info.lastTxRefs ++ acceptanceResult.contextUpdate.lastTxRefs
+        balances = lastArtifact.info.balances ++ acceptanceResult.contextUpdate.balances
+        positiveBalances = balances.filter { case (_, balance) => balance =!= Balance.empty }
 
-        rewards = Rewards.calculateRewards(lastGS.proofs.map(_.id))
+        facilitators = lastArtifact.proofs.map(_.id)
+        transactions = lastArtifact.value.blocks.flatMap(_.block.transactions.toSortedSet).map(_.value)
+
+        rewardTxsForAcceptance <- rewards.feeDistribution(lastArtifact.ordinal, transactions, facilitators).flatMap { feeRewardTxs =>
+          trigger match {
+            case EventTrigger => feeRewardTxs.pure[F]
+            case TimeTrigger  => rewards.mintedDistribution(lastArtifact.epochProgress, facilitators).map(_ ++ feeRewardTxs)
+          }
+        }
+
+        (updatedBalancesByRewards, acceptedRewardTxs) = acceptRewardTxs(positiveBalances, rewardTxsForAcceptance)
 
         returnedDAGEvents = getReturnedDAGEvents(acceptanceResult)
 
@@ -121,15 +171,16 @@ object GlobalSnapshotConsensusFunctions {
           currentOrdinal,
           height,
           subHeight,
-          lastGSHash,
+          lastArtifactHash,
           accepted,
           scSnapshots,
-          rewards,
-          NonEmptyList.of(PeerId(Hex("peer1"))), // TODO
+          acceptedRewardTxs,
+          currentEpochProgress,
+          GlobalSnapshot.nextFacilitators,
           GlobalSnapshotInfo(
             updatedLastStateChannelSnapshotHashes,
             updatedLastTxRefs,
-            updatedBalances
+            updatedBalancesByRewards
           ),
           GlobalSnapshotTips(
             deprecated = deprecated,
@@ -139,6 +190,20 @@ object GlobalSnapshotConsensusFunctions {
         returnedEvents = returnedSCEvents.union(returnedDAGEvents)
       } yield (globalSnapshot, returnedEvents)
     }
+
+    private def acceptRewardTxs(
+      balances: SortedMap[Address, Balance],
+      txs: SortedSet[RewardTransaction]
+    ): (SortedMap[Address, Balance], SortedSet[RewardTransaction]) =
+      txs.foldLeft((balances, SortedSet.empty[RewardTransaction])) { (acc, tx) =>
+        val (updatedBalances, acceptedTxs) = acc
+
+        updatedBalances
+          .getOrElse(tx.destination, Balance.empty)
+          .plus(tx.amount)
+          .map(balance => (updatedBalances.updated(tx.destination, balance), acceptedTxs + tx))
+          .getOrElse(acc)
+      }
 
     private def getTipsUsages(
       lastActive: Set[ActiveTip],
@@ -209,7 +274,7 @@ object GlobalSnapshotConsensusFunctions {
     private def processStateChannelEvents(
       lastGlobalSnapshotInfo: GlobalSnapshotInfo,
       events: List[StateChannelEvent]
-    ): (SortedMap[Address, NonEmptyList[StateChannelSnapshotBinary]], Set[GlobalSnapshotEvent]) = {
+    ): (SortedMap[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]], Set[GlobalSnapshotEvent]) = {
       val lshToSnapshot: Map[(Address, Hash), StateChannelEvent] = events.map { e =>
         (e.address, e.snapshot.value.lastSnapshotHash) -> e
       }.foldLeft(Map.empty[(Address, Hash), StateChannelEvent]) { (acc, entry) =>
@@ -250,17 +315,14 @@ object GlobalSnapshotConsensusFunctions {
                 }
                 .getOrElse(Eval.now(List.empty))
 
-            unfold(initLsh).value.toNel.map(nel =>
-              address -> nel.map { event =>
-                StateChannelSnapshotBinary(event.snapshot.value.lastSnapshotHash, event.snapshot.content)
-
-              }.reverse
-            )
+            unfold(initLsh).value.toNel.map(address -> _.map(_.snapshot).reverse)
         }
         .toSortedMap
 
       (result, Set.empty)
     }
+
+    case object ArtifactMismatch extends InvalidArtifact
 
     object metrics {
 

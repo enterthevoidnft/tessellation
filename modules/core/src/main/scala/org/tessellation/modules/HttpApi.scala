@@ -11,11 +11,12 @@ import org.tessellation.http.routes._
 import org.tessellation.kryo.KryoSerializer
 import org.tessellation.schema.peer.PeerId
 import org.tessellation.sdk.config.AppEnvironment
-import org.tessellation.sdk.config.AppEnvironment.{Dev, Testnet}
+import org.tessellation.sdk.config.AppEnvironment.{Dev, Mainnet, Testnet}
+import org.tessellation.sdk.config.types.HttpConfig
 import org.tessellation.sdk.http.p2p.middleware.{PeerAuthMiddleware, `X-Id-Middleware`}
 import org.tessellation.sdk.http.routes
 import org.tessellation.sdk.http.routes._
-import org.tessellation.sdk.infrastructure.healthcheck.declaration.PeerProposalHealthcheckRoutes
+import org.tessellation.sdk.infrastructure.consensus.ConsensusRoutes
 import org.tessellation.sdk.infrastructure.healthcheck.ping.PingHealthCheckRoutes
 import org.tessellation.sdk.infrastructure.metrics.Metrics
 import org.tessellation.security.SecurityProvider
@@ -35,9 +36,22 @@ object HttpApi {
     healthchecks: HealthChecks[F],
     privateKey: PrivateKey,
     environment: AppEnvironment,
-    selfId: PeerId
+    selfId: PeerId,
+    nodeVersion: String,
+    httpCfg: HttpConfig
   ): HttpApi[F] =
-    new HttpApi[F](storages, queues, services, programs, healthchecks, privateKey, environment, selfId) {}
+    new HttpApi[F](
+      storages,
+      queues,
+      services,
+      programs,
+      healthchecks,
+      privateKey,
+      environment,
+      selfId,
+      nodeVersion,
+      httpCfg
+    ) {}
 }
 
 sealed abstract class HttpApi[F[_]: Async: SecurityProvider: KryoSerializer: Metrics] private (
@@ -48,26 +62,29 @@ sealed abstract class HttpApi[F[_]: Async: SecurityProvider: KryoSerializer: Met
   healthchecks: HealthChecks[F],
   privateKey: PrivateKey,
   environment: AppEnvironment,
-  selfId: PeerId
+  selfId: PeerId,
+  nodeVersion: String,
+  httpCfg: HttpConfig
 ) {
 
   private val mkDagCell: L0Cell.Mk[F] = L0Cell.mkL0Cell(queues.l1Output, queues.stateChannelOutput)
 
   private val clusterRoutes =
     ClusterRoutes[F](programs.joining, programs.peerDiscovery, storages.cluster, services.cluster, services.collateral)
-  private val nodeRoutes = NodeRoutes[F](storages.node)
+  private val nodeRoutes = NodeRoutes[F](storages.node, storages.session, storages.cluster, nodeVersion, httpCfg, selfId)
+
   private val registrationRoutes = RegistrationRoutes[F](services.cluster)
-  private val gossipRoutes = GossipRoutes[F](storages.rumor, queues.rumor, services.gossip)
+  private val gossipRoutes = GossipRoutes[F](storages.rumor, services.gossip)
   private val trustRoutes = TrustRoutes[F](storages.trust, programs.trustPush)
   private val stateChannelRoutes = StateChannelRoutes[F](mkDagCell)
   private val globalSnapshotRoutes = GlobalSnapshotRoutes[F](storages.globalSnapshot)
   private val dagRoutes = DagRoutes[F](services.dag, mkDagCell)
+  private val consensusRoutes = new ConsensusRoutes[F, SnapshotOrdinal](services.cluster, services.consensus.storage, selfId)
 
   private val healthcheckP2PRoutes = {
     val pingHealthcheckRoutes = PingHealthCheckRoutes[F](healthchecks.ping)
-    val peerDeclaration = PeerProposalHealthcheckRoutes[F, SnapshotOrdinal](services.consensus.healthcheck)
 
-    Router("healthcheck" -> (pingHealthcheckRoutes.p2pRoutes <+> peerDeclaration.p2pRoutes))
+    Router("healthcheck" -> pingHealthcheckRoutes.p2pRoutes)
   }
 
   private val debugRoutes = DebugRoutes[F](storages, services).routes
@@ -83,11 +100,12 @@ sealed abstract class HttpApi[F[_]: Async: SecurityProvider: KryoSerializer: Met
             (if (environment == Testnet || environment == Dev) debugRoutes else HttpRoutes.empty) <+>
               metricRoutes <+>
               targetRoutes <+>
-              stateChannelRoutes.publicRoutes <+>
+              (if (environment == Mainnet) HttpRoutes.empty else stateChannelRoutes.publicRoutes) <+>
               clusterRoutes.publicRoutes <+>
               globalSnapshotRoutes.publicRoutes <+>
               dagRoutes.publicRoutes <+>
-              nodeRoutes.publicRoutes
+              nodeRoutes.publicRoutes <+>
+              consensusRoutes.publicRoutes
           }
         }
     }
@@ -104,7 +122,8 @@ sealed abstract class HttpApi[F[_]: Async: SecurityProvider: KryoSerializer: Met
                 gossipRoutes.p2pRoutes <+>
                 trustRoutes.p2pRoutes <+>
                 globalSnapshotRoutes.p2pRoutes <+>
-                healthcheckP2PRoutes
+                healthcheckP2PRoutes <+>
+                consensusRoutes.p2pRoutes
             )
           )
         )

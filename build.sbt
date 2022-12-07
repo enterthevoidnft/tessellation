@@ -11,6 +11,8 @@ resolvers += Resolver.sonatypeRepo("snapshots")
 
 val scalafixCommonSettings = inConfig(IntegrationTest)(scalafixConfigSettings(IntegrationTest))
 
+bloopExportJarClassifiers in Global := Some(Set("sources"))
+
 lazy val commonSettings = Seq(
   scalacOptions ++= List("-Ymacro-annotations", "-Yrangepos", "-Wconf:cat=unused:info", "-language:reflectiveCalls"),
   scalafmtOnCompile := true,
@@ -98,7 +100,8 @@ lazy val wallet = (project in file("modules/wallet"))
       Libraries.refinedCore,
       Libraries.refinedCats,
       Libraries.log4cats,
-      Libraries.logback % Runtime
+      Libraries.logback % Runtime,
+      Libraries.logstashLogbackEncoder % Runtime
     )
   )
 
@@ -132,6 +135,7 @@ lazy val keytool = (project in file("modules/keytool"))
       Libraries.fs2IO,
       Libraries.log4cats,
       Libraries.logback % Runtime,
+      Libraries.logstashLogbackEncoder % Runtime,
       Libraries.monocleCore,
       Libraries.monocleMacro,
       Libraries.newtype,
@@ -187,6 +191,7 @@ lazy val shared = (project in file("modules/shared"))
       Libraries.guava,
       Libraries.log4cats,
       Libraries.logback % Runtime,
+      Libraries.logstashLogbackEncoder % Runtime,
       Libraries.mapref,
       Libraries.monocleCore,
       Libraries.monocleMacro,
@@ -232,7 +237,7 @@ lazy val testShared = (project in file("modules/test-shared"))
   )
 
 lazy val sdk = (project in file("modules/sdk"))
-  .dependsOn(shared % "compile->compile;test->test", testShared % Test, keytool, kernel)
+  .dependsOn(shared % "compile->compile;test->test", testShared % Test, keytool, kernel, dagShared)
   .configs(IntegrationTest)
   .settings(
     name := "tessellation-sdk",
@@ -246,10 +251,12 @@ lazy val sdk = (project in file("modules/sdk"))
       CompilerPlugin.semanticDB,
       Libraries.cats,
       Libraries.catsEffect,
+      Libraries.catsRetry,
       Libraries.circeCore,
       Libraries.circeGeneric,
       Libraries.circeParser,
       Libraries.circeRefined,
+      Libraries.circeShapes,
       Libraries.derevoCore,
       Libraries.derevoCats,
       Libraries.derevoCirce,
@@ -264,10 +271,14 @@ lazy val sdk = (project in file("modules/sdk"))
       Libraries.http4sJwtAuth,
       Libraries.httpSignerCore,
       Libraries.httpSignerHttp4s,
+      Libraries.jawnParser,
+      Libraries.jawnAst,
+      Libraries.jawnFs2,
       Libraries.declineCore,
       Libraries.declineEffect,
       Libraries.declineRefined,
       Libraries.logback,
+      Libraries.logstashLogbackEncoder % Runtime,
       Libraries.log4cats,
       Libraries.micrometerPrometheusRegistry,
       Libraries.shapeless
@@ -287,14 +298,15 @@ lazy val dagShared = (project in file("modules/dag-shared"))
       CompilerPlugin.kindProjector,
       CompilerPlugin.betterMonadicFor,
       CompilerPlugin.semanticDB,
-      Libraries.logback % Runtime
+      Libraries.logback % Runtime,
+      Libraries.logstashLogbackEncoder % Runtime
     )
   )
 
 lazy val dagL1 = (project in file("modules/dag-l1"))
   .enablePlugins(AshScriptPlugin)
   .enablePlugins(JavaAppPackaging)
-  .dependsOn(kernel, shared, dagShared, sdk, testShared % Test)
+  .dependsOn(kernel, shared % "compile->compile;test->test", dagShared, sdk, testShared % Test)
   .configs(IntegrationTest)
   .settings(
     name := "tessellation-dag-l1",
@@ -364,7 +376,8 @@ lazy val tools = (project in file("modules/tools"))
       Libraries.http4sClient,
       Libraries.http4sCirce,
       Libraries.log4cats,
-      Libraries.logback,
+      Libraries.logback % Runtime,
+      Libraries.logstashLogbackEncoder % Runtime,
       Libraries.mapref,
       Libraries.monocleCore,
       Libraries.newtype,
@@ -392,6 +405,7 @@ lazy val core = (project in file("modules/core"))
       CompilerPlugin.semanticDB,
       Libraries.cats,
       Libraries.catsEffect,
+      Libraries.catsRetry,
       Libraries.circeCore,
       Libraries.circeGeneric,
       Libraries.circeParser,
@@ -424,7 +438,8 @@ lazy val core = (project in file("modules/core"))
       Libraries.httpSignerHttp4s,
       Libraries.javaxCrypto,
       Libraries.log4cats,
-      Libraries.logback,
+      Libraries.logback % Runtime,
+      Libraries.logstashLogbackEncoder % Runtime,
       Libraries.mapref,
       Libraries.monocleCore,
       Libraries.newtype,

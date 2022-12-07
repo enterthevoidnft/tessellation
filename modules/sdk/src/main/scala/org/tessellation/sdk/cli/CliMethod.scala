@@ -3,14 +3,13 @@ package org.tessellation.sdk.cli
 import scala.concurrent.duration._
 
 import org.tessellation.cli.env._
-import org.tessellation.schema.balance.{Amount, _}
+import org.tessellation.schema.balance.Amount
 import org.tessellation.schema.node.NodeState
 import org.tessellation.sdk.config.AppEnvironment
 import org.tessellation.sdk.config.AppEnvironment.Mainnet
 import org.tessellation.sdk.config.types._
 
-import eu.timepit.refined.auto.autoRefineV
-import eu.timepit.refined.types.numeric.NonNegLong
+import eu.timepit.refined.auto._
 import fs2.io.file.Path
 
 trait CliMethod {
@@ -33,34 +32,40 @@ trait CliMethod {
     CollateralConfig(
       amount = amount
         .filter(_ => environment != Mainnet)
-        .getOrElse(Amount(NonNegLong.unsafeFrom(250_000L * normalizationFactor)))
+        .getOrElse(Amount(250_000_00000000L))
     )
 
   val gossipConfig: GossipConfig = GossipConfig(
     storage = RumorStorageConfig(
-      activeRetention = 2.seconds,
-      seenRetention = 2.minutes
+      peerRumorsCapacity = 50L,
+      activeCommonRumorsCapacity = 20L,
+      seenCommonRumorsCapacity = 50L
     ),
     daemon = GossipDaemonConfig(
-      fanout = 2,
-      interval = 0.2.seconds,
-      maxConcurrentHandlers = 20
+      peerRound = GossipRoundConfig(
+        fanout = 1,
+        interval = 0.2.seconds,
+        maxConcurrentRounds = 4
+      ),
+      commonRound = GossipRoundConfig(
+        fanout = 1,
+        interval = 0.5.seconds,
+        maxConcurrentRounds = 2
+      )
     )
   )
 
   val leavingDelay = 30.seconds
 
-  val healthCheckConfig = HealthCheckConfig(
+  def healthCheckConfig(pingEnabled: Boolean) = HealthCheckConfig(
     removeUnresponsiveParallelPeersAfter = 10.seconds,
+    requestProposalsAfter = 8.seconds,
     ping = PingHealthCheckConfig(
+      enabled = pingEnabled,
       concurrentChecks = 3,
-      defaultCheckTimeout = 10.seconds,
+      defaultCheckTimeout = 6.seconds,
       defaultCheckAttempts = 3,
       ensureCheckInterval = 10.seconds
-    ),
-    peerDeclaration = PeerDeclarationHealthCheckConfig(
-      receiveTimeout = 20.seconds,
-      triggerInterval = 10.seconds
     )
   )
 
@@ -69,8 +74,7 @@ trait CliMethod {
     gossipConfig,
     httpConfig,
     leavingDelay,
-    stateAfterJoining,
-    healthCheckConfig
+    stateAfterJoining
   )
 
 }

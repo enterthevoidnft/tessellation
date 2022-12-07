@@ -21,6 +21,7 @@ import org.tessellation.dag.l1.domain.transaction.TransactionStorage
 import org.tessellation.dag.l1.domain.transaction.TransactionStorage.{LastTransactionReferenceState, Majority}
 import org.tessellation.dag.l1.{Main, TransactionGenerator}
 import org.tessellation.dag.snapshot._
+import org.tessellation.dag.snapshot.epoch.EpochProgress
 import org.tessellation.ext.cats.effect.ResourceIO
 import org.tessellation.ext.collection.MapRefUtils._
 import org.tessellation.keytool.KeyPairGenerator
@@ -41,6 +42,8 @@ import eu.timepit.refined.auto._
 import eu.timepit.refined.types.numeric.NonNegLong
 import fs2.concurrent.SignallingRef
 import io.chrisdavenport.mapref.MapRef
+import org.scalacheck.Gen.Parameters
+import org.scalacheck.rng.Seed
 import weaver.SimpleIOSuite
 
 object SnapshotProcessorSuite extends SimpleIOSuite with TransactionGenerator {
@@ -112,6 +115,8 @@ object SnapshotProcessorSuite extends SimpleIOSuite with TransactionGenerator {
       }
     }
 
+  val lastSnapshotHash = Hash.arbitrary.arbitrary.pureApply(Parameters.default, Seed(1234L))
+
   val snapshotOrdinal8 = SnapshotOrdinal(8L)
   val snapshotOrdinal9 = SnapshotOrdinal(9L)
   val snapshotOrdinal10 = SnapshotOrdinal(10L)
@@ -140,10 +145,11 @@ object SnapshotProcessorSuite extends SimpleIOSuite with TransactionGenerator {
       snapshotOrdinal10,
       snapshotHeight6,
       snapshotSubHeight0,
-      Hash("hash"),
+      lastSnapshotHash,
       SortedSet.empty,
       SortedMap.empty,
       SortedSet.empty,
+      EpochProgress.MinValue,
       NonEmptyList.one(peerId),
       GlobalSnapshotInfo(SortedMap.empty, SortedMap.empty, SortedMap.empty),
       GlobalSnapshotTips(SortedSet.empty, SortedSet.empty)
@@ -220,6 +226,7 @@ object SnapshotProcessorSuite extends SimpleIOSuite with TransactionGenerator {
                     snapshotHeight6,
                     snapshotSubHeight0,
                     snapshotOrdinal10,
+                    lastSnapshotHash,
                     hashedSnapshot.hash,
                     hashedSnapshot.proofsHash
                   ),
@@ -356,6 +363,7 @@ object SnapshotProcessorSuite extends SimpleIOSuite with TransactionGenerator {
                   snapshotHeight6,
                   snapshotSubHeight0,
                   snapshotOrdinal10,
+                  lastSnapshotHash,
                   hashedSnapshot.hash,
                   hashedSnapshot.proofsHash
                 ),
@@ -431,6 +439,7 @@ object SnapshotProcessorSuite extends SimpleIOSuite with TransactionGenerator {
                   snapshotHeight6,
                   snapshotSubHeight1,
                   snapshotOrdinal11,
+                  hashedLastSnapshot.hash,
                   hashedNextSnapshot.hash,
                   hashedNextSnapshot.proofsHash
                 ),
@@ -565,6 +574,7 @@ object SnapshotProcessorSuite extends SimpleIOSuite with TransactionGenerator {
                   snapshotHeight8,
                   snapshotSubHeight0,
                   snapshotOrdinal11,
+                  hashedLastSnapshot.hash,
                   hashedNextSnapshot.hash,
                   hashedNextSnapshot.proofsHash
                 ),
@@ -745,6 +755,7 @@ object SnapshotProcessorSuite extends SimpleIOSuite with TransactionGenerator {
                   snapshotHeight8,
                   snapshotSubHeight0,
                   snapshotOrdinal11,
+                  hashedLastSnapshot.hash,
                   hashedNextSnapshot.hash,
                   hashedNextSnapshot.proofsHash
                 ),
@@ -791,7 +802,7 @@ object SnapshotProcessorSuite extends SimpleIOSuite with TransactionGenerator {
     }
   }
 
-  test("error should be thrown when a snapshot pushed for processing is not a next one") {
+  test("snapshot should be ignored when a snapshot pushed for processing is not a next one") {
     testResources.use {
       case (snapshotProcessor, sp, kp, srcKey, _, _, _, peerId, _, _, lastSnapR, _) =>
         implicit val securityProvider = sp
@@ -819,14 +830,9 @@ object SnapshotProcessorSuite extends SimpleIOSuite with TransactionGenerator {
           expect.same(
             (processingResult, lastSnapshotAfter),
             (
-              Left(
-                UnexpectedCaseCheckingAlignment(
-                  snapshotHeight6,
-                  snapshotSubHeight0,
-                  snapshotOrdinal10,
-                  snapshotHeight6,
-                  snapshotSubHeight0,
-                  snapshotOrdinal12
+              Right(
+                SnapshotIgnored(
+                  GlobalSnapshotReference.fromHashedGlobalSnapshot(hashedNextSnapshot)
                 )
               ),
               hashedLastSnapshot

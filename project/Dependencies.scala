@@ -5,32 +5,34 @@ object Dependencies {
   object V {
     val bouncyCastle = "1.70"
     val betterFiles = "3.9.1"
-    val cats = "2.7.0"
-    val catsEffect = "3.3.5"
-    val catsRetry = "2.1.0" // not published for CE3 yet
+    val cats = "2.8.0"
+    val catsEffect = "3.3.14"
+    val catsRetry = "3.0.0"
     val circe = "0.14.2"
-    val ciris = "2.3.2"
+    val ciris = "2.3.3"
     val comcast = "3.1.3"
-    val decline = "2.2.0"
+    val decline = "2.3.0"
     val derevo = "0.13.0"
     val doobie = "1.0.0-RC1"
     val droste = "0.9.0"
     val enumeratum = "1.7.0"
-    val h2 = "2.1.212"
+    val h2 = "2.1.214"
     val javaxCrypto = "1.0.1"
-    val flyway = "8.5.12"
-    val fs2 = "3.2.7"
-    val fs2Data = "1.3.1"
+    val jawnVersion = "1.3.2"
+    val jawnFs2Version = "1.2.1"
+    val flyway = "9.1.0"
+    val fs2 = "3.2.11"
+    val fs2Data = "1.4.1"
     val guava = "31.1-jre"
-    val http4s = "0.23.10"
+    val http4s = "0.23.14"
     val http4sJwtAuth = "1.0.0"
     val httpSigner = "0.4.3"
-    val log4cats = "2.3.1"
-    val micrometer = "1.9.0"
+    val log4cats = "2.4.0"
+    val micrometer = "1.9.2"
     val monocle = "3.1.0"
     val mapref = "0.2.0-M2"
     val newtype = "0.4.4"
-    val refined = "0.9.29"
+    val refined = "0.10.1"
     val redis4cats = "1.2.0"
     val skunk = "0.3.1"
     val sqlite = "3.36.0.3"
@@ -42,9 +44,10 @@ object Dependencies {
     val betterMonadicFor = "0.3.1"
     val kindProjector = "0.13.2"
     val logback = "1.2.11"
+    val logstashLogbackEncoder = "7.2"
     val organizeImports = "0.5.0"
-    val semanticDB = "4.5.9"
-    val weaver = "0.7.12"
+    val semanticDB = "4.5.11"
+    val weaver = "0.7.14"
   }
 
   object Libraries {
@@ -65,6 +68,8 @@ object Dependencies {
     def fs2Data(artifact: String): ModuleID = "org.gnieh" %% s"fs2-data-$artifact" % V.fs2Data
     def http4s(artifact: String): ModuleID = "org.http4s" %% s"http4s-$artifact" % V.http4s
     def bouncyCastle(artifact: String): ModuleID = "org.bouncycastle" % artifact % V.bouncyCastle
+
+    def jawn(artifact: String): ModuleID = "org.typelevel" %% artifact % V.jawnVersion
 
     val bc = bouncyCastle("bcprov-jdk15on")
     val bcExtensions = bouncyCastle("bcpkix-jdk15on")
@@ -133,6 +138,10 @@ object Dependencies {
 
     val http4sJwtAuth = "dev.profunktor" %% "http4s-jwt-auth" % V.http4sJwtAuth
 
+    val jawnParser = jawn("jawn-parser")
+    val jawnAst = jawn("jawn-ast")
+    val jawnFs2 = "org.http4s" %% "jawn-fs2" % V.jawnFs2Version
+
     val monocleCore = "dev.optics" %% "monocle-core" % V.monocle
     val monocleMacro = "dev.optics" %% "monocle-macro" % V.monocle
 
@@ -161,6 +170,7 @@ object Dependencies {
 
     // Runtime
     val logback = "ch.qos.logback" % "logback-classic" % V.logback
+    val logstashLogbackEncoder = "net.logstash.logback" % "logstash-logback-encoder" % V.logstashLogbackEncoder
 
     // Test
     val catsLaws = "org.typelevel" %% "cats-laws" % V.cats

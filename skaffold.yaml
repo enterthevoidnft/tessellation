@@ -28,6 +28,8 @@ build:
             - project/*.scala
             - project/**.sbt
             - project/build.properties
+  tagPolicy:
+    inputDigest: {}
 
 deploy:
   kustomize:
@@ -36,6 +38,7 @@ deploy:
       - kubernetes/l1-cluster
       - kubernetes/grafana
       - kubernetes/prometheus
+      - kubernetes/nginx
   logs:
     prefix: podAndContainer
 
@@ -47,22 +50,27 @@ portForward:
   - resourceType: service
     resourceName: l1-initial-validator
     port: 9000
-    localPort: 9100
+    localPort: 9010
   - resourceType: service
     resourceName: grafana
-    port: 8000
-    localPort: 8000
+    port: 3000
+    localPort: 3000
+  - resourceType: service
+    resourceName: http-proxy
+    port: 8080
+    localPort: 8080
 
 profiles:
-  - name: logPods
-    deploy:
-      logs:
-        prefix: podAndContainer
-  - name: onlyL0
+  - name: chaos
     patches:
-      - op: remove
-        path: /build/artifacts/1
-      - op: remove
-        path: /deploy/kustomize/paths/1
-      - op: remove
-        path: /portForward/1
+      - op: add
+        path: /portForward/-
+        value:
+          resourceType: service
+          resourceName: chaos-dashboard
+          namespace: chaos-mesh
+          port: 2333
+          localPort: 2333
+      - op: add
+        path: /deploy/kustomize/paths/-
+        value: kubernetes/chaos-mesh

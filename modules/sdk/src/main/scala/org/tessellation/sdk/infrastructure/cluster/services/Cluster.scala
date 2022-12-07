@@ -9,7 +9,6 @@ import cats.{Applicative, MonadThrow}
 
 import scala.concurrent.duration._
 
-import org.tessellation.effects.GenUUID
 import org.tessellation.ext.crypto._
 import org.tessellation.kryo.KryoSerializer
 import org.tessellation.schema.cluster._
@@ -20,13 +19,14 @@ import org.tessellation.sdk.domain.cluster.services.Cluster
 import org.tessellation.sdk.domain.cluster.storage.{ClusterStorage, SessionStorage}
 import org.tessellation.sdk.domain.node.NodeStorage
 import org.tessellation.security.SecurityProvider
+import org.tessellation.security.hash.Hash
 import org.tessellation.security.signature.Signed
 
 import fs2.concurrent.SignallingRef
 
 object Cluster {
 
-  def make[F[_]: Async: KryoSerializer: SecurityProvider: GenUUID](
+  def make[F[_]: Async: KryoSerializer: SecurityProvider](
     leavingDelay: FiniteDuration,
     httpConfig: HttpConfig,
     selfId: PeerId,
@@ -35,7 +35,8 @@ object Cluster {
     sessionStorage: SessionStorage[F],
     nodeStorage: NodeStorage[F],
     seedlist: Option[Set[PeerId]],
-    restartSignal: SignallingRef[F, Unit]
+    restartSignal: SignallingRef[F, Unit],
+    versionHash: Hash
   ): Cluster[F] =
     new Cluster[F] {
 
@@ -45,7 +46,7 @@ object Cluster {
             case Some(s) => Applicative[F].pure(s)
             case None    => MonadThrow[F].raiseError[SessionToken](SessionDoesNotExist)
           }
-          clusterSession <- clusterStorage.getClusterSession.flatMap {
+          clusterSession <- clusterStorage.getToken.flatMap {
             case Some(s) => Applicative[F].pure(s)
             case None    => MonadThrow[F].raiseError[ClusterSessionToken](ClusterSessionDoesNotExist)
           }
@@ -62,7 +63,8 @@ object Cluster {
             clusterSession,
             clusterId,
             state,
-            seedlistHash
+            seedlistHash,
+            versionHash
           )
 
       def signRequest(signRequest: SignRequest): F[Signed[SignRequest]] =
@@ -79,24 +81,23 @@ object Cluster {
         Temporal[F].start(process).void
       }
 
-      def info: F[Set[Peer]] =
+      def info: F[Set[PeerInfo]] =
         getRegistrationRequest.flatMap { req =>
-          def self = Peer(
+          def self = PeerInfo(
             req.id,
             req.ip,
             req.publicPort,
             req.p2pPort,
-            req.session,
+            req.session.value.toString,
             req.state
           )
 
-          clusterStorage.getPeers.map(_ + self)
+          clusterStorage.getResponsivePeers.map(_.map(PeerInfo.fromPeer) + self)
         }
 
       def createSession: F[ClusterSessionToken] =
-        GenUUID[F].make.map(ClusterSessionToken(_)).flatTap { session =>
-          clusterStorage.setClusterSession(session)
-        }
+        clusterStorage.createToken
+
     }
 
 }

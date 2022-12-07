@@ -126,9 +126,37 @@ Should list existing l0-validator images.
 ## Build images and start cluster
 
 ```
-skaffold dev --trigger manual
+skaffold dev --trigger manual --tail false
 ```
 
 You should see docker images successfully uploaded to the container registry
 and then kubernetes resources successfully deployed on the EKS cluster. Open grafana
-to monitor the L0 and L1 clusters performance [http://localhost:8000](http://localhost:8000).
+to monitor the L0 and L1 clusters performance [http://localhost:3000](http://localhost:3000).
+
+To access the API of individual pods you can use an http proxy. First get the IP address
+of a pod in a cluster.
+
+```
+kubectl get pods -o wide
+```
+
+Then set the env variable `http_proxy` and use curl to query a pod.
+
+```
+export http_proxy=8080
+
+curl <pod-ip-address>:9000/cluster/info
+```
+
+##  Using profiles
+
+### Profile activation
+
+Activate profiles using option `-p`. Profiles can also be manually deactivated by prefixing the profile name with `-`.
+```
+skaffold dev -p foo,-bar
+```
+
+### Profiles
+
+* chaos - inject chaos experiments into the cluster (like a failure of some number of pods) 

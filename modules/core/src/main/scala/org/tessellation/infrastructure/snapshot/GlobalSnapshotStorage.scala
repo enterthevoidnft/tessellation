@@ -1,8 +1,8 @@
 package org.tessellation.infrastructure.snapshot
 
 import cats.Order._
-import cats.effect.std.Queue
-import cats.effect.{Async, Ref, Spawn}
+import cats.effect.std.{Queue, Supervisor}
+import cats.effect.{Async, Ref}
 import cats.syntax.applicative._
 import cats.syntax.applicativeError._
 import cats.syntax.contravariantSemigroupal._
@@ -31,7 +31,6 @@ import eu.timepit.refined.types.numeric.NonNegLong
 import fs2.Stream
 import fs2.concurrent.SignallingRef
 import io.chrisdavenport.mapref.MapRef
-import org.typelevel.log4cats.Logger
 import org.typelevel.log4cats.slf4j.Slf4jLogger
 
 object GlobalSnapshotStorage {
@@ -50,7 +49,7 @@ object GlobalSnapshotStorage {
     }
   }
 
-  def make[F[_]: Async: KryoSerializer](
+  def make[F[_]: Async: KryoSerializer: Supervisor](
     globalSnapshotLocalFileSystemStorage: GlobalSnapshotLocalFileSystemStorage[F],
     inMemoryCapacity: NonNegLong,
     maybeRollbackHash: Option[Hash]
@@ -64,7 +63,7 @@ object GlobalSnapshotStorage {
           .make[F](globalSnapshotLocalFileSystemStorage, inMemoryCapacity)
     }
 
-  private def make[F[_]: Async: KryoSerializer](
+  private def make[F[_]: Async: KryoSerializer: Supervisor](
     globalSnapshotLocalFileSystemStorage: GlobalSnapshotLocalFileSystemStorage[F],
     inMemoryCapacity: NonNegLong,
     rollbackHash: Hash
@@ -95,7 +94,7 @@ object GlobalSnapshotStorage {
   private def make[F[_]: Async: KryoSerializer](
     globalSnapshotLocalFileSystemStorage: GlobalSnapshotLocalFileSystemStorage[F],
     inMemoryCapacity: NonNegLong
-  ): F[GlobalSnapshotStorage[F] with LatestBalances[F]] =
+  )(implicit S: Supervisor[F]): F[GlobalSnapshotStorage[F] with LatestBalances[F]] =
     makeResources().flatMap {
       case (headRef, ordinalCache, hashCache, notPersistedCache, offloadQueue, logger) =>
         implicit val l = logger
@@ -103,7 +102,7 @@ object GlobalSnapshotStorage {
         make(headRef, ordinalCache, hashCache, notPersistedCache, offloadQueue, globalSnapshotLocalFileSystemStorage, inMemoryCapacity)
     }
 
-  def make[F[_]: Async: Logger: KryoSerializer](
+  def make[F[_]: Async: KryoSerializer](
     headRef: SignallingRef[F, Option[Signed[GlobalSnapshot]]],
     ordinalCache: MapRef[F, SnapshotOrdinal, Option[Hash]],
     hashCache: MapRef[F, Hash, Option[Signed[GlobalSnapshot]]],
@@ -111,7 +110,9 @@ object GlobalSnapshotStorage {
     offloadQueue: Queue[F, SnapshotOrdinal],
     globalSnapshotLocalFileSystemStorage: GlobalSnapshotLocalFileSystemStorage[F],
     inMemoryCapacity: NonNegLong
-  ): F[GlobalSnapshotStorage[F] with LatestBalances[F]] = {
+  )(implicit S: Supervisor[F]): F[GlobalSnapshotStorage[F] with LatestBalances[F]] = {
+
+    def logger = Slf4jLogger.getLogger[F]
 
     def offloadProcess: F[Unit] =
       Stream
@@ -154,7 +155,7 @@ object GlobalSnapshotStorage {
                     }
 
                   offload.handleErrorWith { e =>
-                    Logger[F].error(e)(s"Failed offloading global snapshot! Snapshot ordinal=${ordinal.show}")
+                    logger.error(e)(s"Failed offloading global snapshot! Snapshot ordinal=${ordinal.show}")
                   }
               }
             }
@@ -167,7 +168,7 @@ object GlobalSnapshotStorage {
         hashCache(hash).set(snapshot.some) >>
           ordinalCache(snapshot.ordinal).set(hash.some) >>
           globalSnapshotLocalFileSystemStorage.write(snapshot).handleErrorWith { e =>
-            Logger[F].error(e)(s"Failed writing snapshot to disk! hash=$hash ordinal=${snapshot.ordinal}") >>
+            logger.error(e)(s"Failed writing snapshot to disk! hash=$hash ordinal=${snapshot.ordinal}") >>
               notPersistedCache.update(current => current + snapshot.ordinal)
           } >>
           snapshot.ordinal
@@ -175,7 +176,7 @@ object GlobalSnapshotStorage {
             .fold(Applicative[F].unit)(offloadQueue.offer(_))
       }
 
-    Spawn[F].start(offloadProcess).map { _ =>
+    S.supervise(offloadProcess).map { _ =>
       new GlobalSnapshotStorage[F] with LatestBalances[F] {
         def prepend(snapshot: Signed[GlobalSnapshot]): F[Boolean] =
           headRef.modify {
@@ -188,7 +189,13 @@ object GlobalSnapshotStorage {
                 case Right(isNext) if isNext =>
                   (snapshot.some, enqueue(snapshot).map(_ => true))
 
-                case _ => (current.some, false.pure[F])
+                case _ =>
+                  (
+                    current.some,
+                    logger
+                      .debug(s"Trying to prepend ${snapshot.ordinal.show} but the current snapshot is: ${current.ordinal.show}")
+                      .as(false)
+                  )
               }
           }.flatten
 

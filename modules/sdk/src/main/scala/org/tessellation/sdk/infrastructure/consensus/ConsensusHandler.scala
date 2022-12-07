@@ -2,26 +2,27 @@ package org.tessellation.sdk.infrastructure.consensus
 
 import cats.Show
 import cats.effect.Async
-import cats.syntax.all._
+import cats.syntax.flatMap._
+import cats.syntax.functor._
+import cats.syntax.semigroupk._
 
-import scala.reflect.ClassTag
 import scala.reflect.runtime.universe.TypeTag
 
-import org.tessellation.kryo.KryoSerializer
 import org.tessellation.sdk.domain.consensus.ConsensusFunctions
 import org.tessellation.sdk.infrastructure.consensus.declaration._
 import org.tessellation.sdk.infrastructure.consensus.message._
+import org.tessellation.sdk.infrastructure.consensus.registration.Deregistration
 import org.tessellation.sdk.infrastructure.gossip.RumorHandler
 import org.tessellation.security.SecurityProvider
-import org.tessellation.security.signature.Signed
 
+import io.circe.Decoder
 import org.typelevel.log4cats.slf4j.Slf4jLogger
 
 object ConsensusHandler {
 
   def make[F[
     _
-  ]: Async: KryoSerializer: SecurityProvider, Event <: AnyRef: TypeTag: ClassTag, Key: Show: TypeTag: ClassTag, Artifact <: AnyRef: TypeTag](
+  ]: Async: SecurityProvider, Event: TypeTag: Decoder, Key: Show: TypeTag: Decoder, Artifact: TypeTag: Decoder](
     storage: ConsensusStorage[F, Event, Key, Artifact],
     manager: ConsensusManager[F, Key, Artifact],
     fns: ConsensusFunctions[F, Event, Key, Artifact]
@@ -32,7 +33,7 @@ object ConsensusHandler {
     val eventHandler = RumorHandler.fromPeerRumorConsumer[F, ConsensusEvent[Event]]() { rumor =>
       if (fns.triggerPredicate(rumor.content.value))
         storage.addTriggerEvent(rumor.origin, (rumor.ordinal, rumor.content.value)) >>
-          manager.triggerOnEvent
+          manager.facilitateOnEvent
       else
         storage.addEvent(rumor.origin, (rumor.ordinal, rumor.content.value))
     }
@@ -53,22 +54,29 @@ object ConsensusHandler {
         manager.checkForStateUpdate(rumor.content.key)
     }
 
-    val majoritySignatureHandler =
+    val signatureHandler =
       RumorHandler.fromPeerRumorConsumer[F, ConsensusPeerDeclaration[Key, MajoritySignature]]() { rumor =>
         storage.addSignature(rumor.origin, rumor.content.key, rumor.content.declaration) >>=
           manager.checkForStateUpdate(rumor.content.key)
       }
 
-    val signedArtifactHandler = RumorHandler.fromCommonRumorConsumer[F, ConsensusArtifact[Key, Signed[Artifact]]] { rumor =>
-      logger.info(s"Signed artifact received ${rumor.content.key.show}")
+    val peerDeclarationAckHandler =
+      RumorHandler.fromPeerRumorConsumer[F, ConsensusPeerDeclarationAck[Key]]() { rumor =>
+        storage.addPeerDeclarationAck(rumor.origin, rumor.content.key, rumor.content.kind, rumor.content.ack) >>=
+          manager.checkForStateUpdate(rumor.content.key)
+      }
+
+    val deregistrationHandler = RumorHandler.fromPeerRumorConsumer[F, Deregistration[Key]]() { rumor =>
+      storage.deregisterPeer(rumor.origin, rumor.content.key).void
     }
 
     eventHandler <+>
       facilityHandler <+>
       proposalHandler <+>
+      signatureHandler <+>
+      peerDeclarationAckHandler <+>
       artifactHandler <+>
-      majoritySignatureHandler <+>
-      signedArtifactHandler
+      deregistrationHandler
   }
 
 }

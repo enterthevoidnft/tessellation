@@ -4,7 +4,6 @@ import cats.ApplicativeError
 import cats.effect._
 import cats.syntax.applicative._
 import cats.syntax.applicativeError._
-import cats.syntax.option._
 import cats.syntax.semigroupk._
 
 import org.tessellation.cli.method._
@@ -19,7 +18,7 @@ import org.tessellation.modules._
 import org.tessellation.schema.cluster.ClusterId
 import org.tessellation.schema.node.NodeState
 import org.tessellation.sdk.app.{SDK, TessellationIOApp}
-import org.tessellation.sdk.infrastructure.gossip.RumorHandlers
+import org.tessellation.sdk.infrastructure.gossip.{GossipDaemon, RumorHandlers}
 import org.tessellation.sdk.resources.MkHttpServer
 import org.tessellation.sdk.resources.MkHttpServer.ServerName
 import org.tessellation.security.signature.Signed
@@ -83,22 +82,48 @@ object Main
         )
         .asResource
 
-      rumorHandler = RumorHandlers.make[IO](storages.cluster, healthChecks.ping).handlers <+>
+      rumorHandler = RumorHandlers.make[IO](storages.cluster, healthChecks.ping, services.localHealthcheck).handlers <+>
         trustHandler(storages.trust) <+> services.consensus.handler
 
       _ <- Daemons
-        .start(storages, services, programs, queues, healthChecks, validators, p2pClient, rumorHandler, nodeId, cfg)
+        .start(storages, services, programs, queues, healthChecks, nodeId, cfg)
         .asResource
 
       api = HttpApi
-        .make[IO](storages, queues, services, programs, healthChecks, keyPair.getPrivate, cfg.environment, sdk.nodeId)
+        .make[IO](
+          storages,
+          queues,
+          services,
+          programs,
+          healthChecks,
+          keyPair.getPrivate,
+          cfg.environment,
+          sdk.nodeId,
+          BuildInfo.version,
+          cfg.http
+        )
       _ <- MkHttpServer[IO].newEmber(ServerName("public"), cfg.http.publicHttp, api.publicApp)
       _ <- MkHttpServer[IO].newEmber(ServerName("p2p"), cfg.http.p2pHttp, api.p2pApp)
       _ <- MkHttpServer[IO].newEmber(ServerName("cli"), cfg.http.cliHttp, api.cliApp)
 
+      gossipDaemon = GossipDaemon.make[IO](
+        storages.rumor,
+        queues.rumor,
+        storages.cluster,
+        p2pClient.gossip,
+        rumorHandler,
+        validators.rumorValidator,
+        services.localHealthcheck,
+        nodeId,
+        generation,
+        cfg.gossip.daemon,
+        services.collateral
+      )
+
       _ <- (method match {
         case _: RunValidator =>
-          storages.node.tryModifyState(NodeState.Initial, NodeState.ReadyToJoin)
+          gossipDaemon.startAsRegularValidator >>
+            storages.node.tryModifyState(NodeState.Initial, NodeState.ReadyToJoin)
         case _: RunRollback =>
           storages.node.tryModifyState(
             NodeState.Initial,
@@ -112,11 +137,11 @@ object Main
                   services.collateral
                     .hasCollateral(sdk.nodeId)
                     .flatMap(OwnCollateralNotSatisfied.raiseError[IO, Unit].unlessA) >>
-                    services.consensus.storage.setLastKeyAndArtifact((globalSnapshot.ordinal, globalSnapshot).some) >>
-                    services.consensus.manager.scheduleTriggerOnTime
+                    services.consensus.manager.startFacilitatingAfter(globalSnapshot.ordinal, globalSnapshot)
               }
             }
           } >>
+            gossipDaemon.startAsInitialValidator >>
             services.cluster.createSession >>
             services.session.createSession >>
             storages.node.setNodeState(NodeState.Ready)
@@ -127,18 +152,21 @@ object Main
             NodeState.GenesisReady
           ) {
             GenesisLoader.make[IO].load(m.genesisPath).flatMap { accounts =>
-              val genesis = GlobalSnapshot.mkGenesis(accounts.map(a => (a.address, a.balance)).toMap)
+              val genesis = GlobalSnapshot.mkGenesis(
+                accounts.map(a => (a.address, a.balance)).toMap,
+                m.startingEpochProgress
+              )
 
               Signed.forAsyncKryo[IO, GlobalSnapshot](genesis, keyPair).flatMap { signedGenesis =>
                 storages.globalSnapshot.prepend(signedGenesis) >>
                   services.collateral
                     .hasCollateral(sdk.nodeId)
                     .flatMap(OwnCollateralNotSatisfied.raiseError[IO, Unit].unlessA) >>
-                  services.consensus.storage.setLastKeyAndArtifact((genesis.ordinal, signedGenesis).some) >>
-                  services.consensus.manager.scheduleTriggerOnTime
+                  services.consensus.manager.startFacilitatingAfter(genesis.ordinal, signedGenesis)
               }
             }
           } >>
+            gossipDaemon.startAsInitialValidator >>
             services.cluster.createSession >>
             services.session.createSession >>
             storages.node.setNodeState(NodeState.Ready)

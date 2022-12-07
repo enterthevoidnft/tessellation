@@ -1,6 +1,7 @@
 package org.tessellation.modules
 
 import cats.effect.kernel.Async
+import cats.effect.std.Supervisor
 import cats.syntax.flatMap._
 import cats.syntax.functor._
 
@@ -12,14 +13,14 @@ import org.tessellation.infrastructure.trust.storage.TrustStorage
 import org.tessellation.kryo.KryoSerializer
 import org.tessellation.sdk.domain.cluster.storage.{ClusterStorage, SessionStorage}
 import org.tessellation.sdk.domain.collateral.LatestBalances
-import org.tessellation.sdk.domain.gossip.RumorStorage
 import org.tessellation.sdk.domain.node.NodeStorage
+import org.tessellation.sdk.infrastructure.gossip.RumorStorage
 import org.tessellation.sdk.modules.SdkStorages
 import org.tessellation.security.hash.Hash
 
 object Storages {
 
-  def make[F[_]: Async: KryoSerializer](
+  def make[F[_]: Async: KryoSerializer: Supervisor](
     sdkStorages: SdkStorages[F],
     snapshotConfig: SnapshotConfig,
     maybeRollbackHash: Option[Hash]

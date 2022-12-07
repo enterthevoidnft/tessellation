@@ -2,53 +2,61 @@ package org.tessellation.sdk.infrastructure.consensus
 
 import java.security.KeyPair
 
-import cats.data.NonEmptySet
+import cats._
+import cats.data.{NonEmptySet, StateT}
 import cats.effect.Async
-import cats.effect.kernel.Clock
-import cats.kernel.Next
-import cats.syntax.applicative._
-import cats.syntax.flatMap._
-import cats.syntax.foldable._
-import cats.syntax.functor._
-import cats.syntax.option._
-import cats.syntax.order._
-import cats.syntax.show._
-import cats.syntax.traverse._
-import cats.{Applicative, Order, Show}
+import cats.syntax.all._
 
-import scala.reflect.ClassTag
 import scala.reflect.runtime.universe.TypeTag
 
 import org.tessellation.ext.crypto._
 import org.tessellation.kryo.KryoSerializer
-import org.tessellation.schema.node.NodeState
 import org.tessellation.schema.peer.PeerId
-import org.tessellation.sdk.domain.cluster.storage.ClusterStorage
 import org.tessellation.sdk.domain.consensus.ConsensusFunctions
 import org.tessellation.sdk.domain.gossip.Gossip
-import org.tessellation.sdk.infrastructure.consensus.declaration.{Facility, MajoritySignature, Proposal}
+import org.tessellation.sdk.infrastructure.consensus.declaration._
+import org.tessellation.sdk.infrastructure.consensus.declaration.kind.PeerDeclarationKind
 import org.tessellation.sdk.infrastructure.consensus.message._
 import org.tessellation.sdk.infrastructure.consensus.trigger.{ConsensusTrigger, TimeTrigger}
+import org.tessellation.sdk.infrastructure.consensus.update.UnlockConsensusUpdate
+import org.tessellation.sdk.infrastructure.metrics.Metrics
 import org.tessellation.security.SecurityProvider
 import org.tessellation.security.hash.Hash
 import org.tessellation.security.signature.Signed
-import org.tessellation.security.signature.signature.{Signature, SignatureProof}
+import org.tessellation.security.signature.signature.{Signature, SignatureProof, verifySignatureProof}
 import org.tessellation.syntax.sortedCollection._
 
+import eu.timepit.refined.auto._
+import io.circe.Encoder
 import org.typelevel.log4cats.slf4j.Slf4jLogger
 
 trait ConsensusStateUpdater[F[_], Key, Artifact] {
 
-  type MaybeState = Option[ConsensusState[Key, Artifact]]
+  type StateUpdateResult = Option[(ConsensusState[Key, Artifact], ConsensusState[Key, Artifact])]
 
-  def tryUpdateConsensus(key: Key, resources: ConsensusResources[Artifact]): F[MaybeState]
+  /** Tries to conditionally update a consensus based on information collected in `resources`, this includes:
+    *   - unlocking consensus,
+    *   - updating facilitators,
+    *   - spreading historical acks,
+    *   - advancing consensus status.
+    *
+    * Returns `Some((oldState, newState))` when the consensus with `key` exists and update was successful, otherwise `None`
+    */
+  def tryUpdateConsensus(key: Key, resources: ConsensusResources[Artifact]): F[StateUpdateResult]
 
-  def tryFacilitateConsensus(
+  /** Tries to lock a consensus if the current status equals to status in the `referenceState`. Returns `Some((unlockedState, lockedState))`
+    * when the consensus with `key` exists and was successfully locked, otherwise `None`
+    */
+  def tryLockConsensus(key: Key, referenceState: ConsensusState[Key, Artifact]): F[StateUpdateResult]
+
+  /** Tries to spread ack if it wasn't already spread. Returns `Some((oldState, newState))` when the consenus with `key` exists and spread
+    * was successful, otherwise `None`
+    */
+  def trySpreadAck(
     key: Key,
-    trigger: Option[ConsensusTrigger],
-    resources: ConsensusResources[Artifact],
-    lastKeyAndArtifact: (Key, Signed[Artifact])
-  ): F[MaybeState]
+    ackKind: PeerDeclarationKind,
+    resources: ConsensusResources[Artifact]
+  ): F[StateUpdateResult]
 
 }
 
@@ -56,230 +64,317 @@ object ConsensusStateUpdater {
 
   def make[F[
     _
-  ]: Async: Clock: KryoSerializer: SecurityProvider, Event, Key: Show: Order: Next: TypeTag: ClassTag, Artifact <: AnyRef: Show: TypeTag](
+  ]: Async: KryoSerializer: SecurityProvider: Metrics, Event, Key: Show: Order: TypeTag: Encoder, Artifact <: AnyRef: Eq: Show: TypeTag: Encoder](
     consensusFns: ConsensusFunctions[F, Event, Key, Artifact],
     consensusStorage: ConsensusStorage[F, Event, Key, Artifact],
-    clusterStorage: ClusterStorage[F],
+    facilitatorCalculator: FacilitatorCalculator,
     gossip: Gossip[F],
-    seedlist: Option[Set[PeerId]],
-    keyPair: KeyPair,
-    selfId: PeerId
+    keyPair: KeyPair
   ): ConsensusStateUpdater[F, Key, Artifact] = new ConsensusStateUpdater[F, Key, Artifact] {
 
     private val logger = Slf4jLogger.getLoggerFromClass(ConsensusStateUpdater.getClass)
 
-    def tryFacilitateConsensus(
-      key: Key,
-      trigger: Option[ConsensusTrigger],
-      resources: ConsensusResources[Artifact],
-      lastKeyAndArtifact: (Key, Signed[Artifact])
-    ): F[MaybeState] =
-      tryModifyConsensus(key, internalTryFacilitateConsensus(key, trigger, resources, lastKeyAndArtifact))
-        .flatTap(logStatusIfModified(key))
+    private val unlockConsensusFn = UnlockConsensusUpdate.make[F, Key, Artifact]
 
-    def tryUpdateConsensus(key: Key, resources: ConsensusResources[Artifact]): F[MaybeState] =
-      tryModifyConsensus(key, internalTryUpdateConsensus(key, resources))
-        .flatTap(logStatusIfModified(key))
+    def tryLockConsensus(key: Key, referenceState: ConsensusState[Key, Artifact]): F[StateUpdateResult] =
+      tryUpdateExistingConsensus(key, lockConsensus(referenceState))
+
+    def trySpreadAck(
+      key: Key,
+      ackKind: PeerDeclarationKind,
+      resources: ConsensusResources[Artifact]
+    ): F[StateUpdateResult] =
+      tryUpdateExistingConsensus(key, spreadAck(ackKind, resources))
+
+    def tryUpdateConsensus(key: Key, resources: ConsensusResources[Artifact]): F[StateUpdateResult] =
+      tryUpdateExistingConsensus(key, updateConsensus(resources))
 
     import consensusStorage.ModifyStateFn
 
-    private def tryModifyConsensus(
+    private def tryUpdateExistingConsensus(
       key: Key,
-      fn: MaybeState => F[Option[(ConsensusState[Key, Artifact], F[Unit])]]
-    ): F[MaybeState] =
+      fn: ConsensusState[Key, Artifact] => F[(ConsensusState[Key, Artifact], F[Unit])]
+    ): F[StateUpdateResult] =
       consensusStorage
-        .condModifyState(key)(toModifyStateFn(fn))
+        .condModifyState(key)(toUpdateStateFn(fn))
         .flatMap(evalEffect)
+        .flatTap(logIfUpdatedState)
 
-    private def toModifyStateFn(
-      fn: MaybeState => F[Option[(ConsensusState[Key, Artifact], F[Unit])]]
-    ): ModifyStateFn[(MaybeState, F[Unit])] =
-      maybeState =>
-        fn(maybeState).map(_.map {
-          case (state, effect) => (state.some, (state.some, effect))
-        })
-
-    private def evalEffect(result: Option[(MaybeState, F[Unit])]): F[MaybeState] =
-      result.flatTraverse {
-        case (maybeState, effect) => effect.map(_ => maybeState)
-      }
-
-    private def logStatusIfModified(key: Key)(maybeState: MaybeState): F[Unit] =
-      maybeState.traverse { state =>
-        logger.debug {
-          s"Consensus for key ${key.show} has ${state.facilitators.size} facilitator(s) and status ${state.status.show}"
+    private def toUpdateStateFn(
+      fn: ConsensusState[Key, Artifact] => F[(ConsensusState[Key, Artifact], F[Unit])]
+    ): ModifyStateFn[(StateUpdateResult, F[Unit])] = { maybeState =>
+      maybeState.flatTraverse { oldState =>
+        fn(oldState).map {
+          case (newState, effect) =>
+            Option.when(newState =!= oldState)((newState.some, ((oldState, newState).some, effect)))
         }
+      }
+    }
+
+    private def evalEffect(maybeResultAndEffect: Option[(StateUpdateResult, F[Unit])]): F[StateUpdateResult] =
+      maybeResultAndEffect.flatTraverse { case (result, effect) => effect.map(_ => result) }
+
+    private def logIfUpdatedState(updateResult: StateUpdateResult): F[Unit] =
+      updateResult.traverse {
+        case (_, newState) =>
+          logger.info(s"State updated ${newState.show}")
       }.void
 
-    private def internalTryFacilitateConsensus(
-      key: Key,
-      trigger: Option[ConsensusTrigger],
-      resources: ConsensusResources[Artifact],
-      lastKeyAndArtifact: (Key, Signed[Artifact])
-    )(
-      maybeState: MaybeState
-    ): F[Option[(ConsensusState[Key, Artifact], F[Unit])]] =
-      maybeState match {
-        case None =>
-          for {
-            peers <- clusterStorage.getPeers
-            readyPeers = NodeState.ready(peers).map(_.id) + selfId
-            facilitators = calculateFacilitators(
-              resources.proposedFacilitators,
-              readyPeers,
-              resources.removedFacilitators
-            )
-            time <- Clock[F].realTime
-            state = ConsensusState(
-              key,
-              facilitators.toList.sorted,
-              lastKeyAndArtifact,
-              Facilitated[Artifact](trigger),
-              time
-            )
-            bound <- consensusStorage.getUpperBound
-            effect = gossip.spread(ConsensusPeerDeclaration(key, Facility(bound, facilitators, trigger)))
-          } yield (state, effect).some
-        case Some(_) =>
-          none.pure[F]
-      }
-
-    private def internalTryUpdateConsensus(key: Key, resources: ConsensusResources[Artifact])(
-      maybeState: MaybeState
-    ): F[Option[(ConsensusState[Key, Artifact], F[Unit])]] = {
-      val maybeUpdatedState = maybeState
-        .flatMap(internalTryUpdateFacilitators(resources))
-
-      maybeUpdatedState
-        .orElse(maybeState)
-        .flatTraverse(internalTryUpdateStatus(key, resources))
-        .map(_.orElse(maybeUpdatedState.map(state => (state, Applicative[F].unit))))
-    }
-
-    /** Updates the facilitator list if necessary
-      * @return
-      *   Some(newState) if facilitator list required update, otherwise None
-      */
-    private def internalTryUpdateFacilitators(resources: ConsensusResources[Artifact])(
-      state: ConsensusState[Key, Artifact]
-    ): MaybeState = {
-      state.status match {
-        case Facilitated(_) =>
-          calculateFacilitators(
-            resources.proposedFacilitators,
-            state.facilitators.toSet,
-            resources.removedFacilitators
-          ).some
-        case Finished(_, _) =>
-          none
-        case _ =>
-          calculateRemainingFacilitators(state.facilitators.toSet, resources.removedFacilitators).some
-      }
-    }.map(_.toList.sorted).flatMap { facilitators =>
-      if (facilitators =!= state.facilitators)
-        state.copy(facilitators = facilitators).some
+    private def lockConsensus(
+      referenceState: ConsensusState[Key, Artifact]
+    )(state: ConsensusState[Key, Artifact]): F[(ConsensusState[Key, Artifact], F[Unit])] =
+      if (state.status === referenceState.status && state.lockStatus === Open)
+        (state.copy(lockStatus = Closed), Applicative[F].unit).pure[F]
       else
-        none
+        (state, Applicative[F].unit).pure[F]
+
+    private def spreadAck(
+      ackKind: PeerDeclarationKind,
+      resources: ConsensusResources[Artifact]
+    )(state: ConsensusState[Key, Artifact]): F[(ConsensusState[Key, Artifact], F[Unit])] =
+      if (state.spreadAckKinds.contains(ackKind))
+        (state, Applicative[F].unit).pure[F]
+      else {
+        val ack = getAck(ackKind, resources)
+        val newState = state.copy(spreadAckKinds = state.spreadAckKinds.incl(ackKind))
+        val effect = gossip.spread(ConsensusPeerDeclarationAck(state.key, ackKind, ack))
+        (newState, effect).pure[F]
+      }
+
+    private def updateConsensus(resources: ConsensusResources[Artifact])(
+      state: ConsensusState[Key, Artifact]
+    ): F[(ConsensusState[Key, Artifact], F[Unit])] = {
+      val stateAndEffect = for {
+        _ <- unlockConsensusFn(resources)
+        _ <- updateFacilitators(resources)
+        effect1 <- spreadHistoricalAck(resources)
+        effect2 <- advanceStatus(resources)
+      } yield effect1 >> effect2
+
+      stateAndEffect
+        .run(state)
     }
 
-    /** Updates the status if necessary
-      * @return
-      *   Some(newState) if state required update, otherwise None
-      */
-    private def internalTryUpdateStatus(key: Key, resources: ConsensusResources[Artifact])(
-      state: ConsensusState[Key, Artifact]
-    ): F[Option[(ConsensusState[Key, Artifact], F[Unit])]] = {
-      state.status match {
-        case Facilitated(_) =>
-          state.facilitators
-            .traverse(resources.peerDeclarationsMap.get)
-            .flatMap(_.traverse(_.facility))
-            .map(_.foldMap(f => (f.upperBound, f.trigger.toList)))
-            .flatMap { case (bound, triggers) => pickMajority(triggers).map((bound, _)) }
-            .traverse {
-              case (bound, majorityTrigger) =>
-                for {
-                  _ <- Applicative[F].whenA(majorityTrigger === TimeTrigger)(consensusStorage.clearTimeTrigger)
-                  peerEvents <- consensusStorage.pullEvents(bound)
-                  events = peerEvents.toList.flatMap(_._2).map(_._2).toSet
-                  (artifact, returnedEvents) <- consensusFns
-                    .createProposalArtifact(state.lastKeyAndArtifact, majorityTrigger, events)
-                  returnedPeerEvents = peerEvents.map {
-                    case (peerId, events) =>
-                      (peerId, events.filter { case (_, event) => returnedEvents.contains(event) })
-                  }.filter { case (_, events) => events.nonEmpty }
-                  _ <- consensusStorage.addEvents(returnedPeerEvents)
-                  hash <- artifact.hashF
-                  newState = state.copy(status = ProposalMade[Artifact](hash, majorityTrigger, artifact))
-                  effect = gossip.spread(ConsensusPeerDeclaration(key, Proposal(hash)))
-                } yield (newState, effect)
-            }
-        case ProposalMade(proposalHash, majorityTrigger, proposalArtifact) =>
-          val maybeMajority = state.facilitators
-            .traverse(resources.peerDeclarationsMap.get)
-            .flatMap(_.traverse(_.proposal.map(_.hash)))
-            .flatMap(pickMajority[Hash])
-
-          maybeMajority.traverse { majorityHash =>
-            val newState = state.copy(status = MajoritySigned[Artifact](majorityHash, majorityTrigger))
-            for {
-              signature <- Signature.fromHash(keyPair.getPrivate, majorityHash)
-              effect = gossip.spread(ConsensusPeerDeclaration(key, MajoritySignature(signature))) >> {
-                if (majorityHash == proposalHash)
-                  gossip.spreadCommon(ConsensusArtifact(key, proposalArtifact))
-                else
-                  Applicative[F].unit
-              }
-            } yield (newState, effect)
+    private def updateFacilitators(resources: ConsensusResources[Artifact]): StateT[F, ConsensusState[Key, Artifact], Unit] =
+      StateT.modify { state =>
+        if (state.locked)
+          state
+        else
+          state.status match {
+            case _: CollectingFacilities[Artifact] =>
+              state.copy(facilitators =
+                facilitatorCalculator.calculate(resources.peerDeclarationsMap, state.facilitators, state.removedFacilitators)
+              )
+            case _ =>
+              state
           }
-        case MajoritySigned(majorityHash, majorityTrigger) =>
-          val maybeAllSignatures =
-            state.facilitators.sorted.traverse { peerId =>
-              resources.peerDeclarationsMap
-                .get(peerId)
-                .flatMap(peerDeclaration => peerDeclaration.signature.map(signature => (peerId, signature.signature)))
-            }.map(_.map { case (id, signature) => SignatureProof(PeerId._Id.get(id), signature) }.toSet)
-
-          val maybeSignedArtifact = for {
-            allSignatures <- maybeAllSignatures
-            allSignaturesNel <- NonEmptySet.fromSet(allSignatures.toSortedSet)
-            majorityArtifact <- resources.artifacts.get(majorityHash)
-          } yield Signed(majorityArtifact, allSignaturesNel)
-
-          maybeSignedArtifact.traverse { signedArtifact =>
-            val newState = state.copy(status = Finished(signedArtifact, majorityTrigger))
-            consensusFns.consumeSignedMajorityArtifact(signedArtifact).map { _ =>
-              val effect = gossip.spreadCommon(ConsensusArtifact(key, signedArtifact))
-              (newState, effect)
-            }
-          }
-        case Finished(_, _) =>
-          none[(ConsensusState[Key, Artifact], F[Unit])].pure[F]
       }
-    }.flatMap(_.traverse {
-      case (state, effect) =>
-        Clock[F].realTime.map { time =>
-          (state.copy(statusUpdatedAt = time), effect)
+
+    private def spreadHistoricalAck(
+      resources: ConsensusResources[Artifact]
+    ): StateT[F, ConsensusState[Key, Artifact], F[Unit]] =
+      StateT { state =>
+        resources.ackKinds
+          .diff(state.spreadAckKinds)
+          .intersect(state.collectedKinds)
+          .toList
+          .foldLeft((state, Applicative[F].unit)) { (acc, ackKind) =>
+            acc match {
+              case (state, effect) =>
+                val ack = getAck(ackKind, resources)
+                val newState = state.copy(spreadAckKinds = state.spreadAckKinds.incl(ackKind))
+                val newEffect = gossip.spread(ConsensusPeerDeclarationAck(state.key, ackKind, ack))
+                (newState, effect >> newEffect)
+            }
+          }
+          .pure[F]
+      }
+
+    private def advanceStatus(resources: ConsensusResources[Artifact]): StateT[F, ConsensusState[Key, Artifact], F[Unit]] =
+      StateT { state =>
+        if (state.locked)
+          (state, Applicative[F].unit).pure[F]
+        else {
+          state.status match {
+            case CollectingFacilities(maybeFacilityInfo) =>
+              val maybeFacilities = state.facilitators
+                .traverse(resources.peerDeclarationsMap.get)
+                .flatMap(_.traverse(_.facility))
+
+              maybeFacilities
+                .traverseTap(facilities =>
+                  maybeFacilityInfo.traverse(facilityInfo => warnIfForking(facilityInfo.facilitatorsHash)(facilities))
+                )
+                .flatMap {
+                  _.map(_.foldMap(f => (f.upperBound, f.trigger.toList))).flatMap {
+                    case (bound, triggers) => pickMajority(triggers).map((bound, _))
+                  }.traverse {
+                    case (bound, majorityTrigger) =>
+                      Applicative[F].whenA(majorityTrigger === TimeTrigger)(consensusStorage.clearTimeTrigger) >>
+                        state.facilitators.hashF.flatMap { facilitatorsHash =>
+                          maybeFacilityInfo.traverse { facilityInfo =>
+                            for {
+                              peerEvents <- consensusStorage.pullEvents(bound)
+                              events = peerEvents.toList.flatMap(_._2).map(_._2).toSet
+                              (artifact, returnedEvents) <- consensusFns
+                                .createProposalArtifact(state.key, facilityInfo.lastSignedArtifact, majorityTrigger, events)
+                              returnedPeerEvents = peerEvents.map {
+                                case (peerId, events) =>
+                                  (peerId, events.filter { case (_, event) => returnedEvents.contains(event) })
+                              }.filter { case (_, events) => events.nonEmpty }
+                              _ <- consensusStorage.addEvents(returnedPeerEvents)
+                              hash <- artifact.hashF
+                              effect = gossip.spread(ConsensusPeerDeclaration(state.key, Proposal(hash, facilitatorsHash))) *>
+                                gossip.spreadCommon(ConsensusArtifact(state.key, artifact))
+                            } yield (ProposalInfo[Artifact](artifact, hash).some, facilityInfo.lastSignedArtifact.some, effect)
+                          }.map(_.getOrElse((none[ProposalInfo[Artifact]], none[Signed[Artifact]], Applicative[F].unit))).map {
+                            case (maybeProposalInfo, maybeLastSignedArtifact, effect) =>
+                              val newState =
+                                state.copy(status =
+                                  CollectingProposals[Artifact](
+                                    majorityTrigger,
+                                    maybeProposalInfo,
+                                    maybeLastSignedArtifact,
+                                    facilitatorsHash
+                                  )
+                                )
+                              (newState, effect)
+                          }
+                        }
+                  }
+                }
+            case CollectingProposals(majorityTrigger, maybeProposalInfo, maybeLastArtifact, ownFacilitatorsHash) =>
+              val maybeAllProposals = state.facilitators
+                .traverse(resources.peerDeclarationsMap.get)
+                .flatMap(_.traverse(declaration => declaration.proposal))
+
+              maybeAllProposals.traverseTap(warnIfForking(ownFacilitatorsHash)).flatMap {
+                _.map(_.map(_.hash)).flatTraverse { allProposals =>
+                  maybeLastArtifact.map { lastSignedArtifact =>
+                    pickValidatedMajority(lastSignedArtifact, majorityTrigger, resources)(allProposals)
+                  }
+                    .getOrElse(pickMajority(allProposals).pure[F])
+                    .flatMap { maybeMajorityHash =>
+                      state.facilitators.hashF.flatMap { facilitatorsHash =>
+                        maybeMajorityHash.traverse { majorityHash =>
+                          val newState =
+                            state.copy(status = CollectingSignatures[Artifact](majorityHash, majorityTrigger, facilitatorsHash))
+                          val effect = maybeProposalInfo.traverse { proposalInfo =>
+                            Signature.fromHash(keyPair.getPrivate, majorityHash).flatMap { signature =>
+                              gossip.spread(ConsensusPeerDeclaration(state.key, MajoritySignature(signature, facilitatorsHash)))
+                            } >> Metrics[F].recordDistribution(
+                              "dag_consensus_proposal_affinity",
+                              proposalAffinity(allProposals, proposalInfo.proposalArtifactHash)
+                            )
+                          }.void
+                          (newState, effect).pure[F]
+                        }
+                      }
+                    }
+                }
+              }
+
+            case CollectingSignatures(majorityHash, majorityTrigger, ownFacilitatorsHash) =>
+              val maybeAllSignatures =
+                state.facilitators.sorted.traverse { peerId =>
+                  resources.peerDeclarationsMap
+                    .get(peerId)
+                    .flatMap(peerDeclaration => peerDeclaration.signature.map(signature => (peerId, signature)))
+                }
+
+              maybeAllSignatures.traverseTap(signatures => warnIfForking(ownFacilitatorsHash)(signatures.unzip._2)).flatMap {
+                _.map(_.map { case (id, signature) => SignatureProof(PeerId._Id.get(id), signature.signature) }.toList).traverse {
+                  allSignatures =>
+                    allSignatures
+                      .filterA(verifySignatureProof(majorityHash, _))
+                      .flatTap { validSignatures =>
+                        logger
+                          .warn(
+                            s"Removed ${(allSignatures.size - validSignatures.size).show} invalid signatures during consensus for key ${state.key.show}, " +
+                              s"${validSignatures.size.show} valid signatures left"
+                          )
+                          .whenA(allSignatures.size =!= validSignatures.size)
+                      }
+                }.flatMap { maybeOnlyValidSignatures =>
+                  state.facilitators.hashF.map { facilitatorsHash =>
+                    for {
+                      validSignatures <- maybeOnlyValidSignatures
+                      validSignaturesNel <- NonEmptySet.fromSet(validSignatures.toSortedSet)
+                      majorityArtifact <- resources.artifacts.get(majorityHash)
+                      signedArtifact = Signed(majorityArtifact, validSignaturesNel)
+                      newState = state.copy(status = Finished[Artifact](signedArtifact, majorityTrigger, facilitatorsHash))
+                      effect = consensusFns.consumeSignedMajorityArtifact(signedArtifact)
+                    } yield (newState, effect)
+                  }
+                }
+              }
+            case Finished(_, _, _) =>
+              none[(ConsensusState[Key, Artifact], F[Unit])].pure[F]
+          }
+        }.map { maybeStateAndEffect =>
+          maybeStateAndEffect.map { case (state, effect) => (state.copy(lockStatus = Open), effect) }
+            .getOrElse((state, Applicative[F].unit))
         }
-    })
+      }
+
+    private def getAck(ackKind: PeerDeclarationKind, resources: ConsensusResources[Artifact]): Set[PeerId] = {
+      def ackFor[B <: PeerDeclaration](getter: PeerDeclarations => Option[B]): Set[PeerId] =
+        resources.peerDeclarationsMap.view.filter { case (_, peerDeclarations) => getter(peerDeclarations).isDefined }.keys.toSet
+
+      ackKind match {
+        case kind.Facility          => ackFor(_.facility)
+        case kind.Proposal          => ackFor(_.proposal)
+        case kind.MajoritySignature => ackFor(_.signature)
+      }
+    }
+
+    private def warnIfForking(ownFacilitatorsHash: Hash)(
+      declarations: List[PeerDeclaration]
+    ): F[Unit] =
+      pickMajority(declarations.map(_.facilitatorsHash)).traverse { majorityFacilitatorsHash =>
+        logger
+          .warn(s"Different facilitators hashes. This node is in fork")
+          .whenA(majorityFacilitatorsHash =!= ownFacilitatorsHash)
+      }.void
 
     private def pickMajority[A: Order](proposals: List[A]): Option[A] =
       proposals.foldMap(a => Map(a -> 1)).toList.map(_.swap).maximumOption.map(_._2)
 
-    private def calculateFacilitators(
-      proposed: Set[PeerId],
-      local: Set[PeerId],
-      removed: Set[PeerId]
-    ): Set[PeerId] = {
-      val allProposed = proposed.union(local)
-      seedlist
-        .map(_.intersect(allProposed))
-        .getOrElse(allProposed)
-        .diff(removed)
+    private def pickValidatedMajority(
+      lastSignedArtifact: Signed[Artifact],
+      trigger: ConsensusTrigger,
+      resources: ConsensusResources[Artifact]
+    )(proposals: List[Hash]): F[Option[Hash]] = {
+      val sortedProposals = proposals.foldMap(a => Map(a -> 1)).toList.map(_.swap).sorted.reverse
+
+      def go(proposals: List[(Int, Hash)]): F[Option[Hash]] =
+        proposals match {
+          case (occurrences, majorityHash) :: tail =>
+            resources.artifacts
+              .get(majorityHash)
+              .traverse { artifact =>
+                consensusFns.validateArtifact(lastSignedArtifact, trigger)(artifact)
+              }
+              .flatMap {
+                _.flatTraverse {
+                  _.fold(
+                    cause =>
+                      logger.warn(cause)(s"Found invalid majority hash=${majorityHash.show} with occurrences=$occurrences") >> go(tail),
+                    _ => majorityHash.some.pure[F]
+                  )
+                }
+              }
+          case Nil => none[Hash].pure[F]
+        }
+
+      go(sortedProposals)
     }
 
-    private def calculateRemainingFacilitators(local: Set[PeerId], removed: Set[PeerId]): Set[PeerId] =
-      local.diff(removed)
+    private def proposalAffinity[A: Order](proposals: List[A], proposal: A): Double =
+      if (proposals.nonEmpty)
+        proposals.count(Order[A].eqv(proposal, _)).toDouble / proposals.size.toDouble
+      else
+        0.0
 
   }
 

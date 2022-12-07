@@ -1,14 +1,14 @@
 package org.tessellation.dag.snapshot
 
 import cats.data.NonEmptyList
-import cats.effect.{Async, Concurrent}
+import cats.effect.Async
 import cats.syntax.functor._
 import cats.syntax.traverse._
 
 import scala.collection.immutable.{SortedMap, SortedSet}
 
 import org.tessellation.dag.domain.block.BlockReference
-import org.tessellation.ext.codecs.BinaryCodec
+import org.tessellation.dag.snapshot.epoch.EpochProgress
 import org.tessellation.kryo.KryoSerializer
 import org.tessellation.schema.address.Address
 import org.tessellation.schema.balance.Balance
@@ -17,22 +17,25 @@ import org.tessellation.schema.peer.PeerId
 import org.tessellation.schema.transaction.RewardTransaction
 import org.tessellation.security.hash.{Hash, ProofsHash}
 import org.tessellation.security.hex.Hex
+import org.tessellation.security.signature.Signed
 import org.tessellation.syntax.sortedCollection._
 
 import derevo.cats.{eqv, show}
+import derevo.circe.magnolia.{decoder, encoder}
 import derevo.derive
 import eu.timepit.refined.auto._
-import org.http4s.{EntityDecoder, EntityEncoder}
+import eu.timepit.refined.types.numeric.PosInt
 
-@derive(eqv, show)
+@derive(eqv, show, encoder, decoder)
 case class GlobalSnapshot(
   ordinal: SnapshotOrdinal,
   height: Height,
   subHeight: SubHeight,
   lastSnapshotHash: Hash,
   blocks: SortedSet[BlockAsActiveTip],
-  stateChannelSnapshots: SortedMap[Address, NonEmptyList[StateChannelSnapshotBinary]],
+  stateChannelSnapshots: SortedMap[Address, NonEmptyList[Signed[StateChannelSnapshotBinary]]],
   rewards: SortedSet[RewardTransaction],
+  epochProgress: EpochProgress,
   nextFacilitators: NonEmptyList[PeerId],
   info: GlobalSnapshotInfo,
   tips: GlobalSnapshotTips
@@ -49,32 +52,34 @@ case class GlobalSnapshot(
 
 object GlobalSnapshot {
 
-  implicit def encoder[G[_]: KryoSerializer]: EntityEncoder[G, GlobalSnapshot] =
-    BinaryCodec.encoder[G, GlobalSnapshot]
-
-  implicit def decoder[G[_]: Concurrent: KryoSerializer]: EntityDecoder[G, GlobalSnapshot] =
-    BinaryCodec.decoder[G, GlobalSnapshot]
-
-  def mkGenesis(balances: Map[Address, Balance]) =
+  def mkGenesis(balances: Map[Address, Balance], startingEpochProgress: EpochProgress): GlobalSnapshot =
     GlobalSnapshot(
       SnapshotOrdinal.MinValue,
       Height.MinValue,
       SubHeight.MinValue,
-      Hash.empty,
+      Coinbase.hash,
       SortedSet.empty,
       SortedMap.empty,
       SortedSet.empty,
-      NonEmptyList.of(PeerId(Hex("peer1"))), // TODO
+      startingEpochProgress,
+      nextFacilitators,
       GlobalSnapshotInfo(SortedMap.empty, SortedMap.empty, SortedMap.from(balances)),
       GlobalSnapshotTips(
         SortedSet.empty[DeprecatedTip],
-        mkActiveTips(16)
+        mkActiveTips(8)
       )
     )
 
-  private def mkActiveTips(n: Int): SortedSet[ActiveTip] =
+  val nextFacilitators: NonEmptyList[PeerId] =
+    NonEmptyList
+      .of(
+        "e0c1ee6ec43510f0e16d2969a7a7c074a5c8cdb477c074fe9c32a9aad8cbc8ff1dff60bb81923e0db437d2686a9b65b86c403e6a21fa32b6acc4e61be4d70925"
+      )
+      .map(s => PeerId(Hex(s)))
+
+  private def mkActiveTips(n: PosInt): SortedSet[ActiveTip] =
     List
-      .range(0, n)
+      .range(0, n.value)
       .map { i =>
         ActiveTip(BlockReference(Height.MinValue, ProofsHash(s"%064d".format(i))), 0L, SnapshotOrdinal.MinValue)
       }

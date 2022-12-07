@@ -35,11 +35,7 @@ package object shared {
     classOf[NonEmptyList[_]] -> 305,
     classOf[Signed[_]] -> 306,
     classOf[AddressCache] -> 307,
-    classOf[PeerRumorBinary] -> 308,
-    classOf[StartGossipRoundRequest] -> 309,
-    classOf[StartGossipRoundResponse] -> 310,
-    classOf[EndGossipRoundRequest] -> 311,
-    classOf[EndGossipRoundResponse] -> 312,
+    classOf[PeerRumorRaw] -> 308,
     NodeState.Initial.getClass -> 313,
     NodeState.ReadyToJoin.getClass -> 314,
     NodeState.LoadingGenesis.getClass -> 315,
@@ -55,7 +51,7 @@ package object shared {
     NodeState.Offline.getClass -> 325,
     classOf[PublicTrust] -> 326,
     classOf[Ordinal] -> 327,
-    classOf[CommonRumorBinary] -> 328,
+    classOf[CommonRumorRaw] -> 328,
     classOf[Transaction] -> 329,
     Transaction.OrderingInstance.getClass -> 330,
     classOf[TransactionReference] -> 331,
@@ -63,7 +59,8 @@ package object shared {
     classOf[RewardTransaction] -> 333,
     RewardTransaction.OrderingInstance.getClass -> 334,
     classOf[SignedOrdering[_]] -> 335,
-    Address.OrderingInstance.getClass -> 336
+    Address.OrderingInstance.getClass -> 336,
+    NodeState.Observing.getClass -> 337
   )
 
 }

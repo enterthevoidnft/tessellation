@@ -1,8 +1,8 @@
 package org.tessellation.sdk.domain.healthcheck.consensus
 
-import cats.Applicative
 import cats.data.OptionT
 import cats.effect._
+import cats.effect.std.Supervisor
 import cats.syntax.applicative._
 import cats.syntax.applicativeError._
 import cats.syntax.bifunctor._
@@ -10,7 +10,9 @@ import cats.syntax.eq._
 import cats.syntax.flatMap._
 import cats.syntax.functor._
 import cats.syntax.option._
+import cats.syntax.show._
 import cats.syntax.traverse._
+import cats.{Applicative, Show}
 
 import scala.reflect.runtime.universe.TypeTag
 
@@ -25,13 +27,14 @@ import org.tessellation.sdk.domain.healthcheck.consensus.types._
 import org.tessellation.sdk.domain.healthcheck.consensus.types.types.RoundId
 import org.tessellation.sdk.domain.healthcheck.services.HealthCheck
 
+import io.circe.Encoder
 import org.typelevel.log4cats.slf4j.Slf4jLogger
 
 abstract class HealthCheckConsensus[
   F[_]: Async: GenUUID,
-  K <: HealthCheckKey,
+  K <: HealthCheckKey: Show,
   A <: HealthCheckStatus,
-  B <: ConsensusHealthStatus[K, A]: TypeTag,
+  B <: ConsensusHealthStatus[K, A]: TypeTag: Encoder,
   C <: HealthCheckConsensusDecision
 ](
   clusterStorage: ClusterStorage[F],
@@ -40,7 +43,8 @@ abstract class HealthCheckConsensus[
   gossip: Gossip[F],
   config: HealthCheckConfig,
   waitingProposals: Ref[F, Set[B]]
-) extends HealthCheck[F] {
+)(implicit S: Supervisor[F])
+    extends HealthCheck[F] {
   def logger = Slf4jLogger.getLogger[F]
 
   def allRounds: Ref[F, ConsensusRounds[F, K, A, B, C]]
@@ -53,7 +57,7 @@ abstract class HealthCheckConsensus[
 
   def onOutcome(outcomes: ConsensusRounds.Outcome[F, K, A, B, C]): F[Unit]
 
-  def requestProposal(peer: PeerId, round: HealthCheckRoundId): F[Option[B]]
+  def requestProposal(peer: PeerId, roundIds: Set[HealthCheckRoundId], ownProposal: B): F[Option[B]]
 
   def roundsInProgress: F[InProgress[F, K, A, B, C]] = allRounds.get.map(_.inProgress)
   def historicalRounds: F[List[HistoricalRound[K, A, B]]] = allRounds.get.map(_.historical)
@@ -61,7 +65,7 @@ abstract class HealthCheckConsensus[
   def peersUnderConsensus: F[Set[PeerId]] =
     roundsInProgress.map(_.keySet.map(_.id))
 
-  def getOwnProposal(roundId: HealthCheckRoundId): F[Option[B]] = {
+  def getOwnProposal(roundIds: Set[HealthCheckRoundId]): F[Option[B]] = {
     def inProgress =
       roundsInProgress.flatMap { r =>
         r.values.toList.traverse { round =>
@@ -71,12 +75,12 @@ abstract class HealthCheckConsensus[
         }
       }.flatMap { r =>
         r.find {
-          case (_, ids) => ids.contains(roundId)
+          case (_, ids) => ids.intersect(roundIds).nonEmpty
         }.map(_._1).traverse(_.ownConsensusHealthStatus)
       }
 
     def historical = historicalRounds.map { r =>
-      r.find(_.roundIds.contains(roundId)).map(_.ownProposal)
+      r.find(_.roundIds.intersect(roundIds).nonEmpty).map(_.ownProposal)
     }
 
     OptionT(historical).orElseF(inProgress).value
@@ -95,21 +99,28 @@ abstract class HealthCheckConsensus[
     key: K,
     round: HealthCheckConsensusRound[F, K, A, B, C]
   ): F[Unit] =
-    round.getRoundIds.flatMap { roundIds =>
-      Applicative[F].whenA(missingFromPeers.size > 0) {
-        logger.debug(
-          s"Missing proposals for round ids: ${roundIds} for key: ${key} are from peers: ${missingFromPeers}. Requesting proposals"
-        )
-      }
-    } >>
-      missingFromPeers.toList.traverse { id =>
-        requestProposal(id, round.getOwnRoundId).map(_.map((id, _)))
-      }.map(_.flatten)
-        .flatMap(_.traverse {
-          case (peerId, proposal) =>
-            Applicative[F].whenA(peerId === proposal.owner)(handleProposal(proposal))
-        })
-        .void
+    round.elapsed
+      .map(_ >= config.requestProposalsAfter)
+      .ifM(
+        round.getRoundIds.flatMap { roundIds =>
+          Applicative[F].whenA(missingFromPeers.size > 0) {
+            logger.debug(
+              s"Missing proposals for round ids: ${roundIds.show} for key: ${key.show} are from peers: ${missingFromPeers.show}. Requesting proposals"
+            )
+          } >>
+            round.ownConsensusHealthStatus.flatMap { ownProposal =>
+              missingFromPeers.toList.traverse { id =>
+                requestProposal(id, roundIds, ownProposal).map(_.map((id, _)))
+              }.map(_.flatten)
+                .flatMap(_.traverse {
+                  case (peerId, proposal) =>
+                    Applicative[F].whenA(peerId === proposal.owner)(handleProposal(proposal))
+                })
+                .void
+            }
+        },
+        Applicative[F].unit
+      )
 
   private def manageRounds(rounds: ConsensusRounds.InProgress[F, K, A, B, C]): F[Unit] = {
     def checkRounds(inProgress: ConsensusRounds.InProgress[F, K, A, B, C]): F[ConsensusRounds.Finished[F, K, A, B, C]] =
@@ -127,7 +138,7 @@ abstract class HealthCheckConsensus[
         }.map { case (finished, _) => finished }
       }
 
-    logger.info(s"Healthcheck rounds in progress: ${rounds.keySet}") >>
+    logger.info(s"Healthcheck rounds in progress: ${rounds.keySet.show}") >>
       partition(rounds).flatMap {
         case (finished, inProgress) =>
           checkRounds(inProgress).map(r => (finished ++ r, inProgress -- r.keySet))
@@ -135,7 +146,7 @@ abstract class HealthCheckConsensus[
         case (ready, toManage) =>
           toManage.values.toList
             .map(_.manage)
-            .map(Spawn[F].start)
+            .map(S.supervise)
             .sequence
             .as(ready)
       }.flatMap {
@@ -161,31 +172,31 @@ abstract class HealthCheckConsensus[
       }
   }
 
-  private def createRoundId: F[RoundId] = GenUUID[F].make.map(RoundId.apply)
+  protected def createRoundId: F[RoundId] = GenUUID[F].make.map(RoundId.apply)
 
   def startOwnRound(key: K) =
     clusterStorage
       .hasPeerId(key.id)
       .ifM(
-        createRoundId.map(HealthCheckRoundId(_, selfId)).flatMap(startRound(key, _)),
-        logger.warn(s"Trying to start own round for peer ${key.id}, but peer is unknown")
+        createRoundId.map(HealthCheckRoundId(_, selfId)).flatMap(id => startRound(key, Set(id))),
+        logger.warn(s"Trying to start own round for key ${key.show}, but peer is unknown")
       )
 
-  def participateInRound(key: K, roundId: HealthCheckRoundId): F[Unit] =
-    startRound(key, roundId)
+  def participateInRound(key: K, roundIds: Set[HealthCheckRoundId]): F[Unit] =
+    startRound(key, roundIds)
 
   def startRound(
     key: K,
-    roundId: HealthCheckRoundId
+    roundIds: Set[HealthCheckRoundId]
   ): F[Unit] =
-    clusterStorage.getPeers
+    clusterStorage.getResponsivePeers
       .map(_.map(_.id))
       .map(_ - key.id)
       .flatMap { initialPeers =>
         ownStatus(key).flatMap { status =>
           HealthCheckConsensusRound.make[F, K, A, B, C](
             key,
-            roundId,
+            roundIds,
             initialPeers,
             status,
             statusOnError(key),
@@ -201,7 +212,7 @@ abstract class HealthCheckConsensus[
         allRounds.modify {
           case ConsensusRounds(historical, inProgress) =>
             def inProgressRound = inProgress.get(key)
-            def historicalRound = historical.find(_.roundIds.contains(roundId))
+            def historicalRound = historical.find(_.roundIds.intersect(roundIds).nonEmpty)
 
             historicalRound
               .orElse(inProgressRound)
@@ -222,7 +233,7 @@ abstract class HealthCheckConsensus[
                   parallelRound.getRoundIds
                     .flatMap(round.addParallelRounds(key))
                     .flatMap { _ =>
-                      parallelRound.addParallelRounds(key)(Set(roundId))
+                      parallelRound.addParallelRounds(key)(roundIds)
                     }
               }.void
             }
@@ -234,7 +245,7 @@ abstract class HealthCheckConsensus[
 
   def handleProposal(proposal: B, depth: Int = 1): F[Unit] =
     logger.info(
-      s"Received proposal for roundIds: ${proposal.roundId} for peer: ${proposal.key.id} with status: ${proposal.status}"
+      s"Received proposal for roundIds: ${proposal.roundIds.show} for key: ${proposal.key.show} with status: ${proposal.status} from peer: ${proposal.owner.show}"
     ) >>
       (if (proposal.owner === selfId || proposal.key.id === selfId)
          Applicative[F].unit
@@ -242,29 +253,26 @@ abstract class HealthCheckConsensus[
          allRounds.get.flatMap {
            case ConsensusRounds(historical, inProgress) =>
              def inProgressRound = inProgress.get(proposal.key)
-             def historicalRound = historical.find(_.roundIds.contains(proposal.roundId))
+             def historicalRound = historical.find(_.roundIds.intersect(proposal.roundIds).nonEmpty)
 
-             def participate = participateInRound(proposal.key, proposal.roundId)
+             def participate = participateInRound(proposal.key, proposal.roundIds)
 
-             historicalRound
-               .map(handleProposalForHistoricalRound(proposal))
-               .orElse {
-                 inProgressRound.map { r =>
-                   r.hasProposal(proposal).flatMap {
-                     case HealthCheckConsensusRound.ProposalAndOwnerDoesNotExist => r.processProposal(proposal)
-                     case HealthCheckConsensusRound.SameProposalExists =>
-                       logger.debug(s"Same proposal exists, ignoring")
-                     case HealthCheckConsensusRound.OwnersProposalExists => waitingProposals.update(_ + proposal)
-                     case _                                              => logger.error(s"Unpexpected state returned")
-                   }
-                 }
+             inProgressRound.map { r =>
+               r.hasProposal(proposal).flatMap {
+                 case HealthCheckConsensusRound.ProposalAndOwnerDoesNotExist => r.processProposal(proposal)
+                 case HealthCheckConsensusRound.SameProposalExists =>
+                   logger.debug(s"Same proposal exists, ignoring")
+                 case HealthCheckConsensusRound.OwnersProposalExists => waitingProposals.update(_ + proposal)
+                 case _                                              => logger.error(s"Unpexpected state returned")
                }
-               .getOrElse {
-                 if (depth > 0)
-                   participate.flatMap(_ => handleProposal(proposal, depth - 1))
-                 else
-                   (new Throwable("Unexpected recursion!")).raiseError[F, Unit]
-               }
+             }.orElse {
+               historicalRound.map(handleProposalForHistoricalRound(proposal))
+             }.getOrElse {
+               if (depth > 0)
+                 participate.flatMap(_ => handleProposal(proposal, depth - 1))
+               else
+                 (new Throwable("Unexpected recursion!")).raiseError[F, Unit]
+             }
          })
 
   def handleProposalForHistoricalRound(proposal: B)(round: HistoricalRound[K, A, B]): F[Unit] =

@@ -7,7 +7,9 @@ import cats.Applicative
 import cats.effect.{Async, Resource}
 import cats.syntax.all._
 
+import scala.concurrent.duration.FiniteDuration
 import scala.jdk.CollectionConverters._
+import scala.jdk.DurationConverters._
 
 import org.tessellation.sdk.infrastructure.metrics.Metrics.{MetricKey, TagSeq}
 
@@ -48,6 +50,17 @@ trait Metrics[F[_]] {
   def incrementCounterBy(key: MetricKey, value: Float, tags: TagSeq): F[Unit]
   def incrementCounterBy(key: MetricKey, value: Double): F[Unit]
   def incrementCounterBy(key: MetricKey, value: Double, tags: TagSeq): F[Unit]
+
+  def recordTime(key: MetricKey, duration: FiniteDuration, tags: TagSeq = Seq.empty): F[Unit]
+
+  def recordDistribution(key: MetricKey, value: Int): F[Unit]
+  def recordDistribution(key: MetricKey, value: Int, tags: TagSeq): F[Unit]
+  def recordDistribution(key: MetricKey, value: Long): F[Unit]
+  def recordDistribution(key: MetricKey, value: Long, tags: TagSeq): F[Unit]
+  def recordDistribution(key: MetricKey, value: Float): F[Unit]
+  def recordDistribution(key: MetricKey, value: Float, tags: TagSeq): F[Unit]
+  def recordDistribution(key: MetricKey, value: Double): F[Unit]
+  def recordDistribution(key: MetricKey, value: Double, tags: TagSeq): F[Unit]
 
   private[sdk] def getAllAsText: F[String]
 }
@@ -179,6 +192,40 @@ object Metrics {
         private def genericIncrementCounterBy[A: Numeric](key: MetricKey, value: A, tags: TagSeq): F[Unit] =
           Async[F].delay {
             registry.counter(key, toMicrometerTags(tags)).increment(Numeric[A].toDouble(value))
+          }
+
+        def recordTime(key: MetricKey, duration: FiniteDuration, tags: TagSeq): F[Unit] =
+          Async[F].delay {
+            registry.timer(key, toMicrometerTags(tags)).record(duration.toJava)
+          }
+
+        def recordDistribution(key: MetricKey, value: Int): F[Unit] =
+          genericRecordDistribution(key, value, Seq.empty)
+
+        def recordDistribution(key: MetricKey, value: Int, tags: TagSeq): F[Unit] =
+          genericRecordDistribution(key, value, tags)
+
+        def recordDistribution(key: MetricKey, value: Long): F[Unit] =
+          genericRecordDistribution(key, value, Seq.empty)
+
+        def recordDistribution(key: MetricKey, value: Long, tags: TagSeq): F[Unit] =
+          genericRecordDistribution(key, value, tags)
+
+        def recordDistribution(key: MetricKey, value: Float): F[Unit] =
+          genericRecordDistribution(key, value, Seq.empty)
+
+        def recordDistribution(key: MetricKey, value: Float, tags: TagSeq): F[Unit] =
+          genericRecordDistribution(key, value, tags)
+
+        def recordDistribution(key: MetricKey, value: Double): F[Unit] =
+          genericRecordDistribution(key, value, Seq.empty)
+
+        def recordDistribution(key: MetricKey, value: Double, tags: TagSeq): F[Unit] =
+          genericRecordDistribution(key, value, tags)
+
+        private def genericRecordDistribution[A: Numeric](key: MetricKey, value: A, tags: TagSeq): F[Unit] =
+          Async[F].delay {
+            registry.summary(key, toMicrometerTags(tags)).record(Numeric[A].toDouble(value))
           }
 
         def getAllAsText: F[String] = Async[F].delay {

@@ -59,6 +59,9 @@ object NodeStorage {
           }
         }
 
+      def tryModifyStateGetResult(from: Set[NodeState], to: NodeState): F[NodeStateTransition] =
+        modify(from, to)
+
       def nodeStates: Stream[F, NodeState] =
         nodeStateTopic.subscribe(maxQueuedNodeStates)
 

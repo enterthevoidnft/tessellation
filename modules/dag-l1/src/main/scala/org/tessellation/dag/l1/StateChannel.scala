@@ -23,7 +23,7 @@ import org.tessellation.dag.l1.domain.consensus.block.BlockConsensusInput._
 import org.tessellation.dag.l1.domain.consensus.block.BlockConsensusOutput.{CleanedConsensuses, FinalBlock}
 import org.tessellation.dag.l1.domain.consensus.block.Validator.{canStartOwnConsensus, isPeerInputValid}
 import org.tessellation.dag.l1.domain.consensus.block.{BlockConsensusCell, BlockConsensusContext, BlockConsensusInput}
-import org.tessellation.dag.l1.domain.snapshot.programs.SnapshotProcessor.{SnapshotProcessingResult, UnexpectedFailure}
+import org.tessellation.dag.l1.domain.snapshot.programs.SnapshotProcessor.SnapshotProcessingResult
 import org.tessellation.dag.l1.http.p2p.P2PClient
 import org.tessellation.dag.l1.modules._
 import org.tessellation.dag.snapshot.{GlobalSnapshot, GlobalSnapshotReference}
@@ -65,7 +65,8 @@ class StateChannel[F[_]: Async: KryoSerializer: SecurityProvider: Random](
       storages.consensus,
       keyPair,
       selfId,
-      storages.transaction
+      storages.transaction,
+      validators.transaction
     )
 
   private val inspectionTriggerInput: Stream[F, OwnerBlockConsensusInput] = Stream
@@ -95,7 +96,7 @@ class StateChannel[F[_]: Async: KryoSerializer: SecurityProvider: Random](
     .evalMap { _ =>
       storages.lastGlobalSnapshotStorage.get.flatMap {
         _.fold(Applicative[F].unit) { latestSnapshot =>
-          programs.l0PeerDiscovery.discover(latestSnapshot.proofs.map(_.id).map(PeerId._Id.reverseGet))
+          programs.l0PeerDiscovery.discover(latestSnapshot.signed.proofs.map(_.id).map(PeerId._Id.reverseGet))
         }
       }
     }
@@ -220,25 +221,13 @@ class StateChannel[F[_]: Async: KryoSerializer: SecurityProvider: Random](
           programs.snapshotProcessor
             .process(snapshot)
             .map(result => (nextSnapshots, aggResults :+ result).asLeft[List[SnapshotProcessingResult]])
-            .handleErrorWith { e =>
-              (aggResults :+ UnexpectedFailure(e, snapshot))
-                .asRight[(List[Hashed[GlobalSnapshot]], List[SnapshotProcessingResult])]
-                .pure[F]
-            }
 
         case (Nil, aggResults) =>
           aggResults.asRight[(List[Hashed[GlobalSnapshot]], List[SnapshotProcessingResult])].pure[F]
       }
     }
     .evalMap {
-      _.traverse {
-        case UnexpectedFailure(e, snapshot) =>
-          logger.error(e)(
-            s"Snapshot processing failed for: ${GlobalSnapshotReference.fromHashedGlobalSnapshot(snapshot).show} full: ${snapshot.show}"
-          )
-        case result =>
-          logger.info(s"Snapshot processing result: $result")
-      }.void
+      _.traverse(result => logger.info(s"Snapshot processing result: ${result.show}")).void
     }
 
   private val blockConsensus: Stream[F, Unit] =

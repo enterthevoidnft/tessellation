@@ -4,22 +4,23 @@ import java.nio.charset.Charset
 import java.security.spec.X509EncodedKeySpec
 import java.security.{KeyFactory, PublicKey}
 
+import cats.Show
 import cats.effect.Async
 import cats.syntax.flatMap._
 import cats.syntax.functor._
 
 import org.tessellation.security.key.{ECDSA, PublicKeyHexPrefix}
 
-import derevo.cats.{eqv, order, show}
+import derevo.cats.{eqv, order}
 import derevo.circe.magnolia._
 import derevo.derive
-import derevo.scalacheck.arbitrary
 import io.estatico.newtype.macros.newtype
 import io.estatico.newtype.ops._
+import org.scalacheck.{Arbitrary, Gen}
 
 object hex {
 
-  @derive(arbitrary, decoder, encoder, eqv, show, order, keyEncoder, keyDecoder)
+  @derive(decoder, encoder, eqv, order, keyEncoder, keyDecoder)
   @newtype
   case class Hex(value: String) {
 
@@ -51,10 +52,15 @@ object hex {
         }
       } yield pk
 
-    def shortValue: String = value.substring(0, 8)
+    def shortValue: String = value.take(8)
   }
 
   object Hex {
+
+    implicit val show: Show[Hex] = Show.show(_.shortValue)
+
+    implicit val arbitrary: Arbitrary[Hex] =
+      Arbitrary(Gen.sized(size => Gen.stringOfN((size / 2) * 2, Gen.hexChar).map(_.toLowerCase).map(Hex(_))))
 
     def fromBytes(bytes: Array[Byte], sep: Option[String] = None): Hex =
       sep match {

@@ -3,17 +3,20 @@ package org.tessellation.sdk.app
 import java.security.KeyPair
 
 import cats.effect._
-import cats.effect.std.Random
+import cats.effect.std.{Random, Supervisor}
 import cats.syntax.applicative._
+import cats.syntax.either._
 import cats.syntax.option._
 import cats.syntax.show._
 
 import org.tessellation.cli.env.{KeyAlias, Password, StorePath}
 import org.tessellation.ext.cats.effect._
+import org.tessellation.ext.crypto._
 import org.tessellation.ext.kryo._
 import org.tessellation.keytool.KeyStoreUtils
 import org.tessellation.kryo.KryoSerializer
 import org.tessellation.schema.cluster.ClusterId
+import org.tessellation.schema.generation.Generation
 import org.tessellation.schema.peer.PeerId
 import org.tessellation.sdk.cli.CliMethod
 import org.tessellation.sdk.http.p2p.SdkP2PClient
@@ -58,7 +61,7 @@ abstract class TessellationIOApp[A <: CliMethod](
     */
   val kryoRegistrar: Map[Class[_], KryoRegistrationId[KryoRegistrationIdRange]]
 
-  protected implicit val logger = Slf4jLogger.getLogger[IO]
+  protected val logger = Slf4jLogger.getLogger[IO]
 
   def run(method: A, sdk: SDK[IO]): Resource[IO, Unit]
 
@@ -84,50 +87,78 @@ abstract class TessellationIOApp[A <: CliMethod](
                 Metrics.forAsync[IO](Seq(("application", name))).use { implicit _metrics =>
                   SignallingRef.of[IO, Unit](()).flatMap { _restartSignal =>
                     def mkSDK =
-                      for {
-                        _seedlist <- method.seedlistPath
-                          .fold(none[Set[PeerId]].pure[IO])(SeedlistLoader.make[IO].load(_).map(_.some))
-                          .asResource
-                        _ <- _seedlist
-                          .map(_.size)
-                          .fold(logger.info(s"Seedlist disabled.")) { size =>
-                            logger.info(s"Seedlist enabled. Allowed nodes: $size")
+                      Supervisor[IO].flatMap { implicit _supervisor =>
+                        for {
+                          _ <- IO(System.setProperty("self_id", selfId.show)).asResource
+                          _ <- logger.info(s"Self peerId: ${selfId}").asResource
+                          _generation <- Generation.make[IO].asResource
+                          versionHash <- version.hash.liftTo[IO].asResource
+                          _seedlist <- method.seedlistPath
+                            .fold(none[Set[PeerId]].pure[IO])(SeedlistLoader.make[IO].load(_).map(_.some))
+                            .asResource
+                          _ <- _seedlist
+                            .map(_.size)
+                            .fold(logger.info(s"Seedlist disabled.")) { size =>
+                              logger.info(s"Seedlist enabled. Allowed nodes: $size")
+                            }
+                            .asResource
+                          storages <- SdkStorages.make[IO](clusterId, cfg).asResource
+                          res <- SdkResources.make[IO](cfg, _keyPair.getPrivate(), storages.session, selfId)
+                          session = Session.make[IO](storages.session, storages.node, storages.cluster)
+                          p2pClient = SdkP2PClient.make[IO](res.client, session)
+                          queues <- SdkQueues.make[IO].asResource
+                          services <- SdkServices
+                            .make[IO](
+                              cfg,
+                              selfId,
+                              _generation,
+                              _keyPair,
+                              storages,
+                              queues,
+                              session,
+                              p2pClient.node,
+                              _seedlist,
+                              _restartSignal,
+                              versionHash
+                            )
+                            .asResource
+
+                          programs <- SdkPrograms
+                            .make[IO](
+                              cfg,
+                              storages,
+                              services,
+                              p2pClient.cluster,
+                              p2pClient.sign,
+                              services.localHealthcheck,
+                              _seedlist,
+                              selfId,
+                              versionHash
+                            )
+                            .asResource
+
+                          sdk = new SDK[IO] {
+                            val random = _random
+                            val securityProvider = _securityProvider
+                            val kryoPool = _kryoPool
+                            val metrics = _metrics
+                            val supervisor = _supervisor
+
+                            val keyPair = _keyPair
+                            val seedlist = _seedlist
+                            val generation = _generation
+
+                            val sdkResources = res
+                            val sdkP2PClient = p2pClient
+                            val sdkQueues = queues
+                            val sdkStorages = storages
+                            val sdkServices = services
+                            val sdkPrograms = programs
+
+                            def restartSignal = _restartSignal
                           }
-                          .asResource
-                        storages <- SdkStorages.make[IO](clusterId, cfg).asResource
-                        res <- SdkResources.make[IO](cfg, _keyPair.getPrivate(), storages.session, selfId)
-                        session = Session.make[IO](storages.session, storages.node, storages.cluster)
-                        p2pClient = SdkP2PClient.make[IO](res.client, session)
-                        queues <- SdkQueues.make[IO].asResource
-                        services <- SdkServices
-                          .make[IO](cfg, selfId, _keyPair, storages, queues, session, _seedlist, _restartSignal)
-                          .asResource
-
-                        programs <- SdkPrograms
-                          .make[IO](cfg, storages, services, p2pClient.cluster, p2pClient.sign, _seedlist, selfId)
-                          .asResource
-
-                        sdk = new SDK[IO] {
-                          val random = _random
-                          val securityProvider = _securityProvider
-                          val kryoPool = _kryoPool
-                          val metrics = _metrics
-
-                          val keyPair = _keyPair
-                          val seedlist = _seedlist
-
-                          val sdkResources = res
-                          val sdkP2PClient = p2pClient
-                          val sdkQueues = queues
-                          val sdkStorages = storages
-                          val sdkServices = services
-                          val sdkPrograms = programs
-
-                          def restartSignal = _restartSignal
-                        }
-
-                        _ <- logger.info(s"Self peerId: ${selfId.show}").asResource
-                      } yield sdk
+                        } yield sdk
+                      }
 
                     def startup: Resource[IO, Unit] =
                       mkSDK.handleErrorWith { (e: Throwable) =>
@@ -142,7 +173,6 @@ abstract class TessellationIOApp[A <: CliMethod](
                     _restartSignal.discrete.switchMap { _ =>
                       Stream.eval(startup.useForever)
                     }.compile.drain.as(ExitCode.Success)
-
                   }
                 }
               }

@@ -5,11 +5,12 @@ import java.util.UUID
 import scala.util.control.NoStackTrace
 
 import org.tessellation.optics.uuid
+import org.tessellation.schema.generation.Generation
 import org.tessellation.schema.node.NodeState
 import org.tessellation.schema.peer.{P2PContext, PeerId}
 
 import com.comcast.ip4s.{Host, Port}
-import derevo.cats.{eqv, show}
+import derevo.cats.{eqv, order, show}
 import derevo.circe.magnolia.{decoder, encoder}
 import derevo.derive
 import eu.timepit.refined.api.Refined
@@ -27,9 +28,9 @@ object cluster {
     def apply(uuidString: String Refined Uuid): ClusterId = ClusterId.apply(UUID.fromString(uuidString))
   }
 
-  @derive(encoder, decoder, eqv, show, uuid)
+  @derive(encoder, decoder, eqv, show)
   @newtype
-  final case class ClusterSessionToken(value: UUID)
+  final case class ClusterSessionToken(value: Generation)
 
   @derive(decoder, encoder, show)
   case class PeerToJoin(id: PeerId, ip: Host, p2pPort: Port)
@@ -44,16 +45,17 @@ object cluster {
   }
 
   case class NodeStateDoesNotAllowForJoining(nodeState: NodeState) extends NoStackTrace
-  case class PeerIdInUse(id: PeerId) extends NoStackTrace
-  case class PeerHostPortInUse(host: Host, p2pPort: Port) extends NoStackTrace
+  case class PeerAlreadyConnected(id: PeerId, host: Host, p2pPort: Port, session: SessionToken) extends NoStackTrace
   case class PeerNotInSeedlist(id: PeerId) extends NoStackTrace
 
-  @derive(decoder, encoder, eqv, show, uuid)
+  @derive(decoder, encoder, order, show)
   @newtype
-  case class SessionToken(value: UUID)
+  case class SessionToken(value: Generation)
 
   case object SessionDoesNotExist extends NoStackTrace
   case object SessionAlreadyExists extends NoStackTrace
+  case object ClusterSessionAlreadyExists extends NoStackTrace
+  case object NodeNotInCluster extends NoStackTrace
 
   trait TokenVerificationResult
   case object EmptyHeaderToken extends TokenVerificationResult
@@ -68,9 +70,11 @@ object cluster {
   case object IdDuplicationFound extends RegistrationRequestValidation
   case object SeedlistDoesNotMatch extends RegistrationRequestValidation
   case object CollateralNotSatisfied extends RegistrationRequestValidation
+  case object VersionMismatch extends RegistrationRequestValidation
 
   trait ClusterVerificationResult extends NoStackTrace
   case object ClusterIdDoesNotMatch extends ClusterVerificationResult
   case object ClusterSessionDoesNotExist extends ClusterVerificationResult
   case object ClusterSessionDoesNotMatch extends ClusterVerificationResult
+  case object NotInCluster extends ClusterVerificationResult
 }

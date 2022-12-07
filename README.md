@@ -20,30 +20,20 @@ skaffold dev --trigger=manual
 
 This will start both L0 and L1 clusters on kubernetes using current kube-context.
 
-Initial validators for L0 and L1 have their public ports mapped to local ports 9000 and 9100 respectively.
+Initial validators for L0 and L1 have their public ports mapped to local ports 9000 and 9010 respectively.
 
 ```
 curl localhost:9000/cluster/info
-curl localhost:9100/cluster/info
+curl localhost:9010/cluster/info
 ```
 
-This will return a list of validators on L0 and L1. By default, L0 cluster starts with 2 validators (1 initial and 1 
-regular) and L1 with 3 validators (1 initial and 2 regular).
+This will return a list of validators on L0 and L1. By default, both L0 and L1 clusters starts with 3 validators 
+(1 initial and 2 regular).
 
 ### Scaling a cluster
 
 ```
-kubectl scale deployment/l0-validator-deployment --replicas=2
+kubectl scale deployment/l0-validator-deployment --replicas=9
 ```
 
-This scales the L0 cluster to 3 validators total: 1 initial and 2 regular.
-
-
-### Profiles:
-
-* `onlyL0` starts only L0 cluster
-
-Activate profiles using `-p` parameter.
-```
-skaffold dev -p onlyL0
-```
+This scales the L0 cluster to 10 validators total: 1 initial and 9 regular.

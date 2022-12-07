@@ -8,8 +8,10 @@ import org.tessellation.kryo.KryoSerializer
 import org.tessellation.schema.peer.PeerId
 import org.tessellation.sdk.config.types.SdkConfig
 import org.tessellation.sdk.domain.cluster.programs.{Joining, PeerDiscovery}
+import org.tessellation.sdk.domain.healthcheck.LocalHealthcheck
 import org.tessellation.sdk.http.p2p.clients.{ClusterClient, SignClient}
 import org.tessellation.security.SecurityProvider
+import org.tessellation.security.hash.Hash
 
 object SdkPrograms {
 
@@ -19,8 +21,10 @@ object SdkPrograms {
     services: SdkServices[F],
     clusterClient: ClusterClient[F],
     signClient: SignClient[F],
+    localHealthcheck: LocalHealthcheck[F],
     seedlist: Option[Set[PeerId]],
-    nodeId: PeerId
+    nodeId: PeerId,
+    versionHash: Hash
   ): F[SdkPrograms[F]] =
     for {
       pd <- PeerDiscovery.make(clusterClient, storages.cluster, nodeId)
@@ -32,10 +36,12 @@ object SdkPrograms {
         services.cluster,
         services.session,
         storages.session,
+        localHealthcheck,
         seedlist,
         nodeId,
         cfg.stateAfterJoining,
-        pd
+        pd,
+        versionHash
       )
     } yield new SdkPrograms[F](pd, joining) {}
 }
